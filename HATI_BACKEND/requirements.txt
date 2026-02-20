@@ -1,0 +1,7 @@
+torch==2.2.2
+torchaudio==2.2.2
+transformers==4.42.0
+flask==2.3.3
+soundfile
+librosa
+numpy
