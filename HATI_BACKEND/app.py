@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import uuid
+from pathlib import Path
 from transformers import pipeline
 
 from audio_cnn import get_audio_embedding
@@ -130,13 +131,23 @@ def predict():
         if audio_file:
             print("\nProcessing AUDIO...")
 
-            temp_path = f"temp_{uuid.uuid4()}.wav"
+            suffix = Path(audio_file.filename or "").suffix.lower()
+            if suffix != ".wav":
+                return jsonify({
+                    "emotion": "unsupported audio format",
+                    "confidence": 0,
+                    "detail": "Audio must be WAV for the current VGGish pipeline."
+                }), 400
+
+            temp_path = f"temp_{uuid.uuid4()}{suffix}"
             audio_file.save(temp_path)
 
-            audio_embedding = get_audio_embedding(temp_path)
-            print("Audio embedding:", audio_embedding.shape)
-
-            os.remove(temp_path)
+            try:
+                audio_embedding = get_audio_embedding(temp_path)
+                print("Audio embedding:", audio_embedding.shape)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
    
 
