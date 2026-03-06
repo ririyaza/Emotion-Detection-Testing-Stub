@@ -4,8 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import uuid
+from transformers import pipeline
 
-from text_cnn import get_text_embedding, text_cnn
 from audio_cnn import get_audio_embedding
 
 app = Flask(__name__)
@@ -32,41 +32,18 @@ audio_emotion_labels = [
 ]
 
 print("Initializing emotion classifiers...")
-text_classifier = nn.Linear(128, len(emotion_labels))
-text_classifier_loaded = False
+text_model = None
+text_model_loaded = False
 audio_classifier = nn.Linear(128, len(audio_emotion_labels))
 audio_classifier_loaded = False
 
 try:
-    text_state = torch.load("text_model.pth", map_location="cpu")
-    if isinstance(text_state, dict) and "classifier_state_dict" in text_state:
-        text_cnn.load_state_dict(text_state["text_cnn_state_dict"])
-        text_cnn.eval()
-        classifier_state = text_state["classifier_state_dict"]
-        if "weight" in classifier_state:
-            num_classes = classifier_state["weight"].shape[0]
-            text_classifier = nn.Linear(128, num_classes)
-        text_classifier.load_state_dict(classifier_state)
-
-        saved_labels = text_state.get("emotion_labels")
-        if isinstance(saved_labels, list) and len(saved_labels) == text_classifier.out_features:
-            emotion_labels = saved_labels
-        elif len(emotion_labels) != text_classifier.out_features:
-            if len(emotion_labels) > text_classifier.out_features:
-                emotion_labels = emotion_labels[:text_classifier.out_features]
-            else:
-                emotion_labels = emotion_labels + [
-                    f"class_{i}" for i in range(len(emotion_labels), text_classifier.out_features)
-                ]
-    else:
-        # Backward compatibility with older checkpoint format.
-        if isinstance(text_state, dict) and "weight" in text_state:
-            num_classes = text_state["weight"].shape[0]
-            text_classifier = nn.Linear(128, num_classes)
-        text_classifier.load_state_dict(text_state)
-    text_classifier.eval()
-    text_classifier_loaded = True
-    print("Text model loaded successfully!")
+    text_model = pipeline(
+        "text-classification",
+        model="j-hartmann/emotion-english-distilroberta-base"
+    )
+    text_model_loaded = True
+    print("Text model loaded")
 except Exception as e:
     print("TEXT MODEL LOAD ERROR:", e)
     print("Text model unavailable.")
@@ -98,18 +75,18 @@ except Exception as e:
     print("Audio model unavailable.")
 
 
-def classify_text(text_embedding):
-    if not text_classifier_loaded:
+def classify_text(text):
+    if not text_model_loaded:
         return {"emotion": "text model unavailable", "confidence": 0}
 
-    with torch.no_grad():
-        output = text_classifier(text_embedding)
-        probs = F.softmax(output, dim=1)
-        pred_idx = torch.argmax(probs).item()
-        return {
-            "emotion": emotion_labels[pred_idx],
-            "confidence": float(probs[0][pred_idx])
-        }
+    result = text_model(text, truncation=True)
+    if not result:
+        return {"emotion": "error", "confidence": 0}
+    top = result[0]
+    return {
+        "emotion": str(top.get("label", "unknown")).lower(),
+        "confidence": float(top.get("score", 0))
+    }
 
 
 def classify_audio(audio_embedding):
@@ -140,14 +117,14 @@ def predict():
         print("Text input:", text)
         print("Audio present:", audio_file is not None)
 
-        text_embedding = None
+        text_result = None
         audio_embedding = None
 
 
         if text:
             print("\nProcessing TEXT...")
-            text_embedding = get_text_embedding(text)
-            print("Text embedding:", text_embedding.shape)
+            text_result = classify_text(text)
+            print("Text result:", text_result)
 
  
         if audio_file:
@@ -165,21 +142,20 @@ def predict():
 
         print("\nSelecting separated model outputs...")
 
-        if text_embedding is None and audio_embedding is None:
+        if text_result is None and audio_embedding is None:
             return jsonify({
                 "emotion": "no input",
                 "confidence": 0
             })
 
-        if text_embedding is not None and audio_embedding is None:
+        if text_result is not None and audio_embedding is None:
             print("Using TEXT model")
-            text_result = classify_text(text_embedding)
             print("\nFINAL RESULT (TEXT)")
             print("Emotion:", text_result["emotion"])
             print("Confidence:", text_result["confidence"])
             return jsonify(text_result)
 
-        if audio_embedding is not None and text_embedding is None:
+        if audio_embedding is not None and text_result is None:
             print("Using AUDIO model")
             audio_result = classify_audio(audio_embedding)
             print("\nFINAL RESULT (AUDIO)")
@@ -188,7 +164,6 @@ def predict():
             return jsonify(audio_result)
 
         print("Both modalities present: returning separate predictions.")
-        text_result = classify_text(text_embedding)
         audio_result = classify_audio(audio_embedding)
         print("\nFINAL RESULT (SEPARATE)")
         print("Text:", text_result)
