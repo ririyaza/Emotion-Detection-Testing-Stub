@@ -39,4 +39,4 @@ def get_audio_embedding(file_path):
 
     except Exception as e:
         print("Error processing audio:", e)
-        return torch.zeros(1, 128)
+        raise RuntimeError(f"Unable to extract VGGish embedding from '{file_path}': {e}") from e

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
+import random
 from collections import Counter
 from audio_cnn import get_audio_embedding
 
@@ -42,9 +43,12 @@ optimizer = optim.Adam(classifier.parameters(), lr=0.001)
 print("Class counts:", dict(class_counts))
 
 print("Starting training...")
-for epoch in range(3):
+epochs = 20
+for epoch in range(epochs):
+    random.shuffle(audio_samples)
     total_loss = 0
     trained_samples = 0
+    correct = 0
     for sample in audio_samples:
         file_path = sample["file"]
         label_str = sample["emotion"]
@@ -64,12 +68,16 @@ for epoch in range(3):
         optimizer.step()
         total_loss += loss.item()
         trained_samples += 1
-
-        print(f"File: {file_path}, Label: {label_str}, Output: {output.detach().numpy()}")
+        pred = torch.argmax(output, dim=1)
+        correct += int((pred == label).item())
 
     if trained_samples == 0:
         raise RuntimeError("No audio samples matched expected labels.")
-    print(f"Epoch {epoch+1}, Avg Loss: {total_loss/trained_samples}")
+    print(
+        f"Epoch {epoch+1}/{epochs}, "
+        f"Avg Loss: {total_loss/trained_samples:.4f}, "
+        f"Train Acc: {correct/trained_samples:.4f}"
+    )
 
 checkpoint = {
     "classifier_state_dict": classifier.fc.state_dict(),
