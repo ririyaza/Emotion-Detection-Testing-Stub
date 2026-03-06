@@ -35,19 +35,29 @@ class _EmotionPageState extends State<EmotionPage> {
   String emotionResult = "No result yet";
   bool isRecording = false;
   bool isLoading = false;
-  String baseUrl = "http://10.102.135.110:5000";
 
-  Future<void> predictText() async {
+  String baseUrl = "http://192.168.1.21:5000";
+
+  Future<void> predictEmotion({String? text, File? audioFile}) async {
     setState(() => isLoading = true);
 
     try {
-      final response = await http.post(
-        Uri.parse("$baseUrl/predict_text"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"text": _controller.text}),
+      var request = http.MultipartRequest(
+        "POST",
+        Uri.parse("$baseUrl/predict"),
       );
 
-      final data = jsonDecode(response.body);
+      if (text != null && text.isNotEmpty) {
+        request.fields['text'] = text;
+      }
+
+      if (audioFile != null) {
+        request.files.add(await http.MultipartFile.fromPath("audio", audioFile.path));
+      }
+
+      var response = await request.send();
+      var responseData = await response.stream.bytesToString();
+      var data = jsonDecode(responseData);
 
       setState(() {
         emotionResult = data["emotion"].toString();
@@ -60,6 +70,7 @@ class _EmotionPageState extends State<EmotionPage> {
       setState(() => isLoading = false);
     }
   }
+
 
   Future<void> startRecording() async {
     if (await _record.hasPermission()) {
@@ -95,41 +106,19 @@ class _EmotionPageState extends State<EmotionPage> {
     });
 
     if (path != null) {
-      await sendAudio(File(path));
+      await predictEmotion(
+        text: _controller.text.isEmpty ? null : _controller.text,
+        audioFile: File(path),
+      );
     }
 
     setState(() => isLoading = false);
   }
 
-  Future<void> sendAudio(File file) async {
-    try {
-      var request = http.MultipartRequest(
-        "POST",
-        Uri.parse("$baseUrl/predict_audio"),
-      );
-
-      request.files.add(await http.MultipartFile.fromPath("audio", file.path));
-
-      var response = await request.send();
-      var responseData = await response.stream.bytesToString();
-      var data = jsonDecode(responseData);
-
-      setState(() {
-        emotionResult = data["emotion"].toString();
-      });
-    } catch (e) {
-      setState(() {
-        emotionResult = "Error: $e";
-      });
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("Emotion Detection"),
-      ),
+      appBar: AppBar(title: const Text("Emotion Detection")),
       body: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(
@@ -138,18 +127,27 @@ class _EmotionPageState extends State<EmotionPage> {
               controller: _controller,
               decoration: const InputDecoration(labelText: "Enter text"),
             ),
+
             const SizedBox(height: 20),
+
             ElevatedButton(
-              onPressed: isLoading ? null : predictText,
+              onPressed: isLoading
+                  ? null
+                  : () => predictEmotion(
+                text: _controller.text.isEmpty ? null : _controller.text,
+              ),
               child: const Text("Detect Text Emotion"),
             ),
+
             const SizedBox(height: 20),
+
             ElevatedButton(
               onPressed: isLoading
                   ? null
                   : () => isRecording ? stopRecording() : startRecording(),
               child: Text(isRecording ? "Stop Recording" : "Start Recording"),
             ),
+
             const SizedBox(height: 40),
 
             if (isLoading) ...[
