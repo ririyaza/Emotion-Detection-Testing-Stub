@@ -36,7 +36,7 @@ class _EmotionPageState extends State<EmotionPage> {
   bool isRecording = false;
   bool isLoading = false;
 
-  String baseUrl = "http://192.168.1.21:5000";
+  String baseUrl = "http://10.215.96.110:5000";
 
   Future<void> predictEmotion({String? text, File? audioFile}) async {
     setState(() => isLoading = true);
@@ -60,7 +60,12 @@ class _EmotionPageState extends State<EmotionPage> {
       var data = jsonDecode(responseData);
 
       setState(() {
-        emotionResult = data["emotion"].toString();
+        final finalEmotion = data["final"]?["emotion"];
+        final audioEmotion = data["audio"]?["emotion"];
+        final textEmotion = data["emotion"] ?? data["text"]?["emotion"];
+
+        emotionResult = (finalEmotion ?? audioEmotion ?? textEmotion ?? "no emotion").toString();
+
       });
     } catch (e) {
       setState(() {
@@ -80,8 +85,9 @@ class _EmotionPageState extends State<EmotionPage> {
       await _record.start(
         const RecordConfig(
           encoder: AudioEncoder.wav,
-          sampleRate: 44100,
-          bitRate: 128000,
+          sampleRate: 16000,
+          numChannels: 1,
+          bitRate: 256000,
         ),
         path: path,
       );
@@ -107,7 +113,7 @@ class _EmotionPageState extends State<EmotionPage> {
 
     if (path != null) {
       await predictEmotion(
-        text: _controller.text.isEmpty ? null : _controller.text,
+        text: null,
         audioFile: File(path),
       );
     }
