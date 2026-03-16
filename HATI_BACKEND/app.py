@@ -4,10 +4,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import uuid
+import wave
 from pathlib import Path
 from transformers import pipeline
 
 from audio_cnn import get_audio_embedding
+
+
+class AudioClassifier(nn.Module):
+    def __init__(self, input_dim=128, num_classes=7):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.35),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 app = Flask(__name__)
 
@@ -33,40 +53,50 @@ audio_emotion_labels = [
 ]
 
 print("Initializing emotion classifiers...")
-text_model = None
 text_model_loaded = False
-audio_classifier = nn.Linear(128, len(audio_emotion_labels))
+stt_model_loaded = False
+audio_classifier = AudioClassifier(num_classes=len(audio_emotion_labels))
 audio_classifier_loaded = False
+audio_norm_mean = None
+audio_norm_std = None
+
+TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "bhadresh-savani/distilbert-base-uncased-emotion")
+STT_MODEL_NAME = os.getenv("STT_MODEL_NAME", "openai/whisper-small")
+MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "1.0"))
 
 try:
     text_model = pipeline(
         "text-classification",
-        model="j-hartmann/emotion-english-distilroberta-base"
+        model=TEXT_MODEL_NAME,
+        truncation=True,
     )
     text_model_loaded = True
-    print("Text model loaded")
+    print(f"Text model loaded: {TEXT_MODEL_NAME}")
 except Exception as e:
     print("TEXT MODEL LOAD ERROR:", e)
     print("Text model unavailable.")
 
 try:
+    stt_model = pipeline(
+        "automatic-speech-recognition",
+        model=STT_MODEL_NAME,
+    )
+    stt_model_loaded = True
+    print(f"STT model loaded: {STT_MODEL_NAME}")
+except Exception as e:
+    print("STT MODEL LOAD ERROR:", e)
+    print("STT model unavailable.")
+
+try:
     audio_state = torch.load("audio_classifier.pth", map_location="cpu")
     if isinstance(audio_state, dict) and "classifier_state_dict" in audio_state:
         classifier_state = audio_state["classifier_state_dict"]
-        if "fc.weight" in classifier_state and "fc.bias" in classifier_state:
-            classifier_state = {
-                "weight": classifier_state["fc.weight"],
-                "bias": classifier_state["fc.bias"],
-            }
         audio_classifier.load_state_dict(classifier_state)
         if "emotion_labels" in audio_state and len(audio_state["emotion_labels"]) == len(audio_emotion_labels):
             audio_emotion_labels = audio_state["emotion_labels"]
+        audio_norm_mean = audio_state.get("mean")
+        audio_norm_std = audio_state.get("std")
     else:
-        if "fc.weight" in audio_state and "fc.bias" in audio_state:
-            audio_state = {
-                "weight": audio_state["fc.weight"],
-                "bias": audio_state["fc.bias"],
-            }
         audio_classifier.load_state_dict(audio_state)
     audio_classifier.eval()
     audio_classifier_loaded = True
@@ -80,14 +110,25 @@ def classify_text(text):
     if not text_model_loaded:
         return {"emotion": "text model unavailable", "confidence": 0}
 
-    result = text_model(text, truncation=True)
+    result = text_model(text)
     if not result:
         return {"emotion": "error", "confidence": 0}
+
     top = result[0]
-    return {
-        "emotion": str(top.get("label", "unknown")).lower(),
-        "confidence": float(top.get("score", 0))
+    raw_label = str(top.get("label", "unknown")).lower()
+    score = float(top.get("score", 0))
+
+    label_map = {
+        "joy": "happy",
+        "sadness": "sad",
+        "fear": "anxious",
+        "anger": "anger",
+        "disgust": "disgust",
+        "surprise": "surprised",
+        "neutral": "neutral",
     }
+    mapped_label = label_map.get(raw_label, raw_label)
+    return {"emotion": mapped_label, "confidence": score}
 
 
 def classify_audio(audio_embedding):
@@ -95,6 +136,8 @@ def classify_audio(audio_embedding):
         return {"emotion": "audio model unavailable", "confidence": 0}
 
     with torch.no_grad():
+        if audio_norm_mean is not None and audio_norm_std is not None:
+            audio_embedding = (audio_embedding - audio_norm_mean) / audio_norm_std
         output = audio_classifier(audio_embedding)
         probs = F.softmax(output, dim=1)
         pred_idx = torch.argmax(probs).item()
@@ -102,6 +145,71 @@ def classify_audio(audio_embedding):
             "emotion": audio_emotion_labels[pred_idx],
             "confidence": float(probs[0][pred_idx])
         }
+
+
+def transcribe_audio(audio_path):
+    if not stt_model_loaded:
+        return {"text": "", "error": "stt model unavailable"}
+
+    try:
+        result = stt_model(
+            audio_path,
+            generate_kwargs={"language": "english", "task": "transcribe"},
+        )
+    except Exception as e:
+        return {"text": "", "error": f"stt error: {e}"}
+
+    if isinstance(result, dict):
+        text = str(result.get("text", "")).strip()
+        return {"text": text, "error": ""}
+
+    return {"text": str(result).strip(), "error": ""}
+
+
+def get_wav_duration_seconds(audio_path):
+    try:
+        with wave.open(audio_path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            if rate <= 0:
+                return 0.0
+            return frames / float(rate)
+    except Exception:
+        return 0.0
+
+
+def normalize_emotion_label(label):
+    if not label:
+        return label
+    label = str(label).strip().lower()
+    if label == "angry":
+        return "anger"
+    return label
+
+
+def fuse_emotions(audio_result, text_result):
+    if not audio_result and not text_result:
+        return None
+
+    a_label = normalize_emotion_label(audio_result.get("emotion", "")) if audio_result else ""
+    t_label = normalize_emotion_label(text_result.get("emotion", "")) if text_result else ""
+    a_conf = float(audio_result.get("confidence", 0)) if audio_result else 0.0
+    t_conf = float(text_result.get("confidence", 0)) if text_result else 0.0
+
+    if t_conf <= 0 and a_conf <= 0:
+        return None
+    if t_conf <= 0:
+        return {"emotion": a_label, "confidence": a_conf}
+    if a_conf <= 0:
+        return {"emotion": t_label, "confidence": t_conf}
+
+    if a_label == t_label:
+        combined = min(1.0, (a_conf + t_conf) / 2.0)
+        return {"emotion": a_label, "confidence": combined}
+
+    if a_conf >= t_conf:
+        return {"emotion": a_label, "confidence": a_conf}
+    return {"emotion": t_label, "confidence": t_conf}
 
 
 @app.route("/predict", methods=["POST"])
@@ -119,7 +227,9 @@ def predict():
         print("Audio present:", audio_file is not None)
 
         text_result = None
+        text_from_audio = None
         audio_embedding = None
+        transcript = None
 
 
         if text:
@@ -145,6 +255,24 @@ def predict():
             try:
                 audio_embedding = get_audio_embedding(temp_path)
                 print("Audio embedding:", audio_embedding.shape)
+                duration_sec = get_wav_duration_seconds(temp_path)
+                file_size = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+                print(f"Audio duration: {duration_sec:.2f}s, bytes: {file_size}")
+                if duration_sec < MIN_AUDIO_SECONDS:
+                    transcript = {
+                        "text": "",
+                        "error": f"audio too short ({duration_sec:.2f}s)"
+                    }
+                    print("STT skipped:", transcript["error"])
+                else:
+                    print("\nRunning STT on audio...")
+                    transcript = transcribe_audio(temp_path)
+                    if transcript.get("text"):
+                        print("Transcript:", transcript["text"])
+                        text_from_audio = classify_text(transcript["text"])
+                        print("Text-from-audio result:", text_from_audio)
+                    elif transcript.get("error"):
+                        print("STT error:", transcript["error"])
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
@@ -169,24 +297,54 @@ def predict():
         if audio_embedding is not None and text_result is None:
             print("Using AUDIO model")
             audio_result = classify_audio(audio_embedding)
+            fused = None
+            if text_from_audio is not None:
+                fused = fuse_emotions(audio_result, text_from_audio)
             print("\nFINAL RESULT (AUDIO)")
-            print("Emotion:", audio_result["emotion"])
-            print("Confidence:", audio_result["confidence"])
-            return jsonify(audio_result)
+            if fused:
+                print("Emotion:", fused["emotion"])
+                print("Confidence:", fused["confidence"])
+            else:
+                print("Emotion:", audio_result["emotion"])
+                print("Confidence:", audio_result["confidence"])
+            response = {
+                "audio": audio_result
+            }
+            if transcript is not None:
+                response["transcript"] = transcript.get("text", "")
+                response["stt_error"] = transcript.get("error", "")
+            if text_from_audio is not None:
+                response["text_from_audio"] = text_from_audio
+            if fused is not None:
+                response["final"] = fused
+            return jsonify(response)
 
         print("Both modalities present: returning separate predictions.")
         audio_result = classify_audio(audio_embedding)
+        fused = None
+        if text_from_audio is not None:
+            fused = fuse_emotions(audio_result, text_from_audio)
         print("\nFINAL RESULT (SEPARATE)")
         print("Text:", text_result)
         print("Audio:", audio_result)
+        if fused:
+            print("Fused:", fused)
 
         print("==============================\n")
 
-        return jsonify({
+        response = {
             "mode": "separate",
             "text": text_result,
             "audio": audio_result
-        })
+        }
+        if transcript is not None:
+            response["transcript"] = transcript.get("text", "")
+            response["stt_error"] = transcript.get("error", "")
+        if text_from_audio is not None:
+            response["text_from_audio"] = text_from_audio
+        if fused is not None:
+            response["final"] = fused
+        return jsonify(response)
 
     except Exception as e:
 
