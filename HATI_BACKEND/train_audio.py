@@ -301,6 +301,8 @@ for i, label in enumerate(emotion_labels):
     acc = (class_correct[i] / total) if total > 0 else 0.0
     print(f"{label:>9}: {acc:.4f} ({class_correct[i]}/{total})")
 
+print("\nPer-class F1:")
+per_class_f1 = []
 macro_f1 = 0.0
 valid_classes = 0
 for i in range(len(emotion_labels)):
@@ -310,15 +312,17 @@ for i in range(len(emotion_labels)):
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     if tp + fp + fn == 0:
+        per_class_f1.append(0.0)
         continue
     f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+    per_class_f1.append(f1)
     macro_f1 += f1
     valid_classes += 1
+    print(f"{emotion_labels[i]:>9}: {f1:.4f} (P={precision:.4f}, R={recall:.4f})")
 if valid_classes > 0:
     macro_f1 /= valid_classes
 print(f"\nMacro-F1: {macro_f1:.4f}")
 
-print(header)
 for i, label in enumerate(emotion_labels):
     row = " ".join([f"{confusion[i, j].item():>7}" for j in range(len(emotion_labels))])
     print(f"{label[:9]:>9} {row}")

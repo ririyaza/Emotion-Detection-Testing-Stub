@@ -1,14 +1,26 @@
 from flask import Flask, request, jsonify
+import os
+import warnings
+try:
+    from numpy import VisibleDeprecationWarning
+except Exception:
+    VisibleDeprecationWarning = Warning
+
+warnings.filterwarnings("ignore", category=VisibleDeprecationWarning)
+os.environ.setdefault("TRANSFORMERS_NO_TQDM", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 import uuid
 import wave
 from pathlib import Path
 from transformers import pipeline
+from transformers.utils import logging as hf_logging
 
 from audio_cnn import get_audio_embedding
+from scenario_engine import ScenarioEngine
 
 
 class AudioClassifier(nn.Module):
@@ -53,14 +65,16 @@ audio_emotion_labels = [
 ]
 
 print("Initializing emotion classifiers...")
+hf_logging.set_verbosity_error()
 text_model_loaded = False
 stt_model_loaded = False
 audio_classifier = AudioClassifier(num_classes=len(audio_emotion_labels))
 audio_classifier_loaded = False
 audio_norm_mean = None
 audio_norm_std = None
+scenario_engine = ScenarioEngine(storage_path="scenario_sessions.json")
 
-TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "bhadresh-savani/distilbert-base-uncased-emotion")
+TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "j-hartmann/emotion-english-distilroberta-base")
 STT_MODEL_NAME = os.getenv("STT_MODEL_NAME", "openai/whisper-small")
 MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "1.0"))
 
@@ -69,6 +83,7 @@ try:
         "text-classification",
         model=TEXT_MODEL_NAME,
         truncation=True,
+        top_k=1,
     )
     text_model_loaded = True
     print(f"Text model loaded: {TEXT_MODEL_NAME}")
@@ -105,16 +120,36 @@ except Exception as e:
     print("AUDIO MODEL LOAD ERROR:", e)
     print("Audio model unavailable.")
 
+scenario_engine.set_renderer(None)
+
 
 def classify_text(text):
     if not text_model_loaded:
         return {"emotion": "text model unavailable", "confidence": 0}
+
+    cleaned = str(text or "").strip().lower()
+    if cleaned in {"anxious", "anxiety", "fear"}:
+        return {"emotion": "anxious", "confidence": 1.0}
+    if cleaned in {"sad", "sadness"}:
+        return {"emotion": "sad", "confidence": 1.0}
+    if cleaned in {"happy", "joy"}:
+        return {"emotion": "happy", "confidence": 1.0}
+    if cleaned in {"angry", "anger"}:
+        return {"emotion": "anger", "confidence": 1.0}
+    if cleaned in {"disgust"}:
+        return {"emotion": "disgust", "confidence": 1.0}
+    if cleaned in {"surprised", "surprise"}:
+        return {"emotion": "surprised", "confidence": 1.0}
+    if cleaned in {"neutral"}:
+        return {"emotion": "neutral", "confidence": 1.0}
 
     result = text_model(text)
     if not result:
         return {"emotion": "error", "confidence": 0}
 
     top = result[0]
+    if isinstance(top, list) and top:
+        top = top[0]
     raw_label = str(top.get("label", "unknown")).lower()
     score = float(top.get("score", 0))
 
@@ -126,6 +161,7 @@ def classify_text(text):
         "disgust": "disgust",
         "surprise": "surprised",
         "neutral": "neutral",
+        "love": "happy",
     }
     mapped_label = label_map.get(raw_label, raw_label)
     return {"emotion": mapped_label, "confidence": score}
@@ -355,6 +391,116 @@ def predict():
             "emotion": "error",
             "confidence": 0
         })
+
+
+@app.route("/scenario/start", methods=["POST"])
+def scenario_start():
+    session_id, payload = scenario_engine.start_session()
+    return jsonify({
+        "session_id": session_id,
+        "payload": payload
+    })
+
+
+@app.route("/scenario/step", methods=["POST"])
+def scenario_step():
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+
+    user_text = (data.get("text") or "").strip()
+    emotion = ""
+    if user_text:
+        print(f"[SCENARIO] User text: {user_text}")
+        text_result = classify_text(user_text)
+        emotion = text_result.get("emotion", "")
+        print(f"[SCENARIO] Text emotion: {emotion} | confidence: {text_result.get('confidence')}")
+    else:
+        print("[SCENARIO] No text provided for emotion detection.")
+
+    payload = {
+        "text": user_text,
+        "emotion": emotion,
+        "selections": data.get("selections", {}),
+        "suds": data.get("suds")
+    }
+
+    response_payload = scenario_engine.handle_step(session_id, payload)
+    return jsonify({
+        "session_id": session_id,
+        "payload": response_payload
+    })
+
+
+@app.route("/scenario/step_audio", methods=["POST"])
+def scenario_step_audio():
+    session_id = request.form.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+
+    audio_file = request.files.get("audio")
+    if audio_file is None:
+        return jsonify({"error": "audio required"}), 400
+
+    suffix = Path(audio_file.filename or "").suffix.lower()
+    if suffix != ".wav":
+        return jsonify({
+            "error": "unsupported audio format",
+            "detail": "Audio must be WAV for the current VGGish pipeline."
+        }), 400
+
+    temp_path = f"temp_{uuid.uuid4()}{suffix}"
+    audio_file.save(temp_path)
+
+    transcript = None
+    text_from_audio = None
+    audio_result = None
+    fused = None
+    try:
+        audio_embedding = get_audio_embedding(temp_path)
+        audio_result = classify_audio(audio_embedding)
+        duration_sec = get_wav_duration_seconds(temp_path)
+        if duration_sec >= MIN_AUDIO_SECONDS:
+            transcript = transcribe_audio(temp_path)
+            if transcript.get("text"):
+                print(f"[SCENARIO] Transcript: {transcript['text']}")
+                text_from_audio = classify_text(transcript["text"])
+                print(f"[SCENARIO] Text-from-audio emotion: {text_from_audio.get('emotion')} | confidence: {text_from_audio.get('confidence')}")
+            elif transcript.get("error"):
+                print("STT error:", transcript["error"])
+        if text_from_audio is not None:
+            fused = fuse_emotions(audio_result, text_from_audio)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    final_emotion = (fused or audio_result or {}).get("emotion", "")
+    if audio_result is not None:
+        print(f"[SCENARIO] Audio emotion: {audio_result.get('emotion')} | confidence: {audio_result.get('confidence')}")
+    if fused is not None:
+        print(f"[SCENARIO] Fused emotion: {fused.get('emotion')} | confidence: {fused.get('confidence')}")
+    if not final_emotion:
+        print("[SCENARIO] Final emotion empty.")
+    user_text = ""
+    if transcript is not None:
+        user_text = transcript.get("text", "")
+
+    payload = {
+        "text": user_text,
+        "emotion": final_emotion,
+        "selections": {},
+        "suds": None
+    }
+
+    response_payload = scenario_engine.handle_step(session_id, payload)
+    return jsonify({
+        "session_id": session_id,
+        "payload": response_payload,
+        "transcript": user_text,
+        "audio": audio_result,
+        "final": fused
+    })
 
 
 if __name__ == "__main__":
