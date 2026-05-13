@@ -393,13 +393,20 @@ def predict():
         })
 
 
+def _json_merge_session(session_id, payload):
+    out = {"session_id": session_id}
+    if isinstance(payload, dict):
+        out.update(payload)
+    return out
+
+
 @app.route("/scenario/start", methods=["POST"])
 def scenario_start():
-    session_id, payload = scenario_engine.start_session()
-    return jsonify({
-        "session_id": session_id,
-        "payload": payload
-    })
+    data = request.get_json(silent=True) or {}
+    theme = data.get("theme", "")
+    scenario_key = data.get("scenario_key", "")
+    session_id, payload = scenario_engine.start_session(theme=theme, scenario_key=scenario_key)
+    return jsonify(_json_merge_session(session_id, payload))
 
 
 @app.route("/scenario/step", methods=["POST"])
@@ -427,10 +434,7 @@ def scenario_step():
     }
 
     response_payload = scenario_engine.handle_step(session_id, payload)
-    return jsonify({
-        "session_id": session_id,
-        "payload": response_payload
-    })
+    return jsonify(_json_merge_session(session_id, response_payload))
 
 
 @app.route("/scenario/step_audio", methods=["POST"])
@@ -494,13 +498,13 @@ def scenario_step_audio():
     }
 
     response_payload = scenario_engine.handle_step(session_id, payload)
-    return jsonify({
-        "session_id": session_id,
-        "payload": response_payload,
+    out = _json_merge_session(session_id, response_payload)
+    out.update({
         "transcript": user_text,
         "audio": audio_result,
-        "final": fused
+        "final": fused,
     })
+    return jsonify(out)
 
 
 if __name__ == "__main__":

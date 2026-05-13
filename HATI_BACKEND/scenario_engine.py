@@ -2,6 +2,27 @@ import json
 import os
 import uuid
 
+# One scenario key per theme — keep strings in sync with Flutter `modules_screen.dart`.
+THEME_SCENARIO_KEYS = {
+    "Fear of Authority": "foa_supervisor",
+    "Fear of Negative Evaluation & Embarrassment": "fne_stage",
+    "Physiological Symptoms": "phys_classroom",
+    "Fear of Social Gatherings": "fsg_party",
+    "Fear of Strangers & New People": "fsn_seat",
+    "Fear of Being Observed & Performing": "fbop_spotlight",
+}
+
+# Which scenario_key values are valid for each theme.
+# For Fear of Authority we allow both variants: professor signature vs "where to sit".
+ALLOWED_SCENARIO_KEYS = {
+    "Fear of Authority": {"foa_supervisor", "foa_classroom"},
+    "Fear of Negative Evaluation & Embarrassment": {"fne_stage"},
+    "Physiological Symptoms": {"phys_classroom"},
+    "Fear of Social Gatherings": {"fsg_party"},
+    "Fear of Strangers & New People": {"fsn_seat"},
+    "Fear of Being Observed & Performing": {"fbop_spotlight"},
+}
+
 
 class ScenarioEngine:
     """
@@ -17,11 +38,13 @@ class ScenarioEngine:
     def set_renderer(self, renderer):
         return None
 
-    def start_session(self):
+    def start_session(self, theme="", scenario_key=""):
+        theme_key = self._normalize_theme(theme)
+        sk = self._resolve_scenario_key(theme_key, scenario_key or "")
         session_id = str(uuid.uuid4())
         self.sessions[session_id] = {
             "step": "scene0_greet",
-            "data": {}
+            "data": {"theme": theme_key, "scenario_key": sk},
         }
         self._save()
         return session_id, self._scene0_greet()
@@ -40,12 +63,18 @@ class ScenarioEngine:
         if step == "scene0_greet":
             state["step"] = "scene0_intro"
             self._save()
-            return self._scene0_intro()
+            return self._scene0_intro(
+                data.get("theme", ""),
+                data.get("scenario_key", ""),
+            )
 
         if step == "scene0_intro":
             state["step"] = "pies_physical"
             self._save()
-            return self._scene1_intro()
+            return self._scene1_intro(
+                data.get("theme", ""),
+                data.get("scenario_key", ""),
+            )
 
         if step == "pies_physical":
             data["pies_physical"] = user_text
@@ -195,20 +224,136 @@ class ScenarioEngine:
         ]
         return self._payload(messages, {"type": "buttons", "options": ["Begin"]})
 
-    def _scene0_intro(self):
-        messages = [
+    def _scene0_intro(self, theme="", scenario_key=""):
+        messages = self._scene0_intro_messages(theme, scenario_key)
+        return self._payload(messages, {"type": "text_input", "placeholder": "Type anything to continue..."})
+
+    def _scene0_intro_messages(self, theme, scenario_key=""):
+        messages_by_theme = {
+            "Fear of Authority": [
+                "Today's scenario is: The Professor's Signature.",
+                "You'll practice asking for something from an authority figure with a calm, clear request.",
+                "We'll go step by step and keep it realistic.",
+            ],
+            "Fear of Negative Evaluation & Embarrassment": [
+                "Today's scenario is: The Group Project: Defending Your Work.",
+                "You'll practice speaking up when your work might be judged by others.",
+                "We'll focus on steady wording and tolerating awkward moments.",
+            ],
+            "Physiological Symptoms": [
+                "Today's scenario is: The Bus Stop: Hiding Visible Anxiety.",
+                "You'll practice staying present while your body feels noticeable to you.",
+                "We'll use small grounding steps so you can continue anyway.",
+            ],
+            "Fear of Social Gatherings": [
+                "Today's scenario is: The House Party: To Approach or Not?",
+                "You'll practice entering a social space and choosing one small approach step.",
+                "We'll keep it low-pressure and doable.",
+            ],
+            "Fear of Strangers & New People": [
+                "Today's scenario is: The Food Hall's Seat.",
+                "You'll practice sitting near someone you don't know and opening with a simple line.",
+                "Small steps count.",
+            ],
+            "Fear of Being Observed & Performing": [
+                "Today's scenario is: Thesis Defense: Defended or Offended.",
+                "You'll practice responding when you're being observed and evaluated.",
+                "We'll focus on calm structure and recovery after tough moments.",
+            ],
+        }
+        if theme == "Fear of Authority" and scenario_key == "foa_classroom":
+            return [
+                "Today's scenario is: WHERE TO SIT?.",
+                "You'll practice choosing a seat near someone you don't know and starting with a simple, grounded line.",
+                "Small steps count, and you can take your time.",
+            ]
+
+        return messages_by_theme.get(theme, [
             "Today's scenario involves something many people find challenging—talking to someone new.",
             "I'll be here with you the whole time, helping you prepare and guiding you with coping strategies.",
             "You're not alone in this.",
-        ]
-        return self._payload(messages, {"type": "text_input", "placeholder": "Type anything to continue..."})
+        ])
 
-    def _scene1_intro(self):
-        messages = [
-            "You've just walked into your new class. It's the first day for your major subject, so the room is filled with mostly unfamiliar faces.",
-            "The room is about half full. Some people are talking quietly, others are on their phones.",
-            "There's an empty seat next to a student near the middle of the room. They haven't noticed you yet.",
-            "This is your opportunity to practice approaching someone new.",
+    def _normalize_theme(self, theme):
+        if not theme:
+            return ""
+        theme = theme.strip()
+        known = {
+            "fear of authority": "Fear of Authority",
+            "fear of negative evaluation & embarrassment": "Fear of Negative Evaluation & Embarrassment",
+            "fear of negative evaluation & embarassment": "Fear of Negative Evaluation & Embarrassment",
+            "physiological symptoms": "Physiological Symptoms",
+            "fear of social gatherings": "Fear of Social Gatherings",
+            "fear of strangers & new people": "Fear of Strangers & New People",
+            "fear of being observed & performing": "Fear of Being Observed & Performing",
+        }
+        lowered = theme.lower()
+        return known.get(lowered, theme)
+
+    def _resolve_scenario_key(self, theme, raw_key):
+        canonical = THEME_SCENARIO_KEYS.get(theme, "general_default")
+        allowed = ALLOWED_SCENARIO_KEYS.get(theme, {canonical})
+        rk = str(raw_key or "").strip()
+        if rk in allowed:
+            return rk
+        return canonical
+
+    def _scene1_intro(self, theme="", scenario_key=""):
+        canonical = THEME_SCENARIO_KEYS.get(theme, "general_default")
+        allowed = ALLOWED_SCENARIO_KEYS.get(theme, {canonical})
+        sk = scenario_key if scenario_key in allowed else canonical
+        setup = {
+            "foa_classroom": [
+                "You've just walked into your new class. It's the first day for your major subject, so the room is filled with mostly unfamiliar faces.",
+                "The room is about half full. Some people are talking quietly, others are on their phones.",
+                "There's an empty seat next to a student near the middle of the room. They haven't noticed you yet.",
+                "This is your opportunity to practice approaching someone new.",
+            ],
+            "foa_supervisor": [
+                "You're outside your supervisor's office for a five-minute team update.",
+                "You can hear low voices inside; a few teammates are already seated along the wall.",
+                "When you step in, you'll share one clear progress note and listen for a quick reply.",
+                "This is your chance to practice sounding steady even when authority is in the room.",
+            ],
+            "fne_stage": [
+                "You've joined a seminar where each person introduces themselves briefly to the whole room.",
+                "The facilitator is inviting the next volunteer—and eyes may turn toward people who haven't gone yet.",
+                "Your row has an empty gap; stepping in signals you're ready without pushing past anyone.",
+                "This is your opportunity to speak with the spotlight briefly on you.",
+            ],
+            "phys_classroom": [
+                "You've just walked into your new class. It's the first day for your major subject, so the room is filled with mostly unfamiliar faces.",
+                "The room is about half full. Some people are talking quietly, others are on their phones.",
+                "There's an empty seat next to a student near the middle of the room. They haven't noticed you yet.",
+                "This is your opportunity to practice approaching someone new while noticing bodily sensations kindly.",
+            ],
+            "fsg_party": [
+                "You've just arrived at a casual get-together in a friend's living room—snacks out, chatter building.",
+                "Small groups are forming; laughter pops up from corners you haven't joined yet.",
+                "There's space on a couch where one friendly face has made eye contact twice already.",
+                "This is your opportunity to practice slipping into a relaxed group vibe.",
+            ],
+            "fsn_seat": [
+                "You're in a weekday workshop circle where everyone takes turns sharing lightly.",
+                "Most seats are spoken for; beside you is someone who arrived solo like you.",
+                "They tuck their bag politely—there's clearly room if you claim the seat with a nod.",
+                "This is your opportunity to settle in next to someone you do not know yet.",
+            ],
+            "fbop_spotlight": [
+                "You're in class when the facilitator asks pairs to briefly demo something in front of everyone.",
+                "Your neighbor's group just finished—they're grinning nervously—and the facilitator glances toward your row.",
+                "Taking the next cue means standing for a minute while others observe.",
+                "This is your opportunity to tolerate being visibly 'on' for a short moment.",
+            ],
+            "general_default": [
+                "You've just walked into your new class. It's the first day for your major subject, so the room is filled with mostly unfamiliar faces.",
+                "The room is about half full. Some people are talking quietly, others are on their phones.",
+                "There's an empty seat next to a student near the middle of the room. They haven't noticed you yet.",
+                "This is your opportunity to practice approaching someone new.",
+            ],
+        }
+        body = setup.get(sk) or setup["general_default"]
+        messages = list(body) + [
             "Before we do anything, let's check in. Physical: How does your body feel?",
         ]
         return self._payload(

@@ -17,36 +17,26 @@ print("VGGish ready.")
 
 
 def get_audio_embedding(file_path, augment=False, rng=None, verbose=True):
-    """
-    Takes a WAV audio file path, converts it to VGGish input,
-    and returns a 128-dimensional embedding tensor.
-    """
+    
     if verbose:
         print("\nAudio Processing:")
         print("File:", file_path)
 
     try:
+        """
+        Loads the WAV file in 16-bit PCM format 
+        and then converts audio samples to float values between -1 and 1.
+        """
         wav_data, sr = sf.read(file_path, dtype="int16")
         if wav_data is None or len(wav_data) == 0:
             raise ValueError("Audio file is empty or unreadable.")
 
         samples = wav_data / 32768.0
-        if augment:
-            if rng is None:
-                rng = np.random.default_rng()
-            gain = rng.uniform(0.7, 1.3)
-            samples = samples * gain
-            noise_std = rng.uniform(0.0, 0.02)
-            if noise_std > 0:
-                noise = rng.normal(0.0, noise_std, size=samples.shape)
-                samples = samples + noise
-            max_shift = int(0.1 * sr)
-            if max_shift > 0:
-                shift = rng.integers(-max_shift, max_shift + 1)
-                if shift != 0:
-                    samples = np.roll(samples, shift)
-            samples = np.clip(samples, -1.0, 1.0)
 
+        """
+        Resample & Padding: VGGish expects audio at 16 kHz. If the sample rate is different, we resample the audio.
+        Additionally, VGGish processes audio in 0.96-second window. If the audio is shorter than this, we repeat it until it meets the minimum length requirement.
+        """
         target_sr = vggish_params.SAMPLE_RATE
         min_samples = int(vggish_params.EXAMPLE_WINDOW_SECONDS * target_sr)
         if sr != target_sr:
@@ -58,10 +48,15 @@ def get_audio_embedding(file_path, augment=False, rng=None, verbose=True):
             reps = int(np.ceil(min_samples / max(est_len, 1)))
             samples = np.tile(samples, reps)
 
+        
         x = vggish_input.waveform_to_examples(samples, sr, return_tensor=False)
         if x is None or len(x) == 0:
             raise ValueError("No VGGish examples produced after padding.")
 
+        """
+        Tensor Shaping for CNN: VGGish expects input tensors of shape [batch_size, 1, num_frames, num_bands].
+        We ensure the input tensor has the correct shape by adding a channel dimension if necessary, and averaging across channels if the input is multi-channel. This allows us to handle various input shapes gracefully while ensuring compatibility with the VGGish model. We also include verbose logging to help debug any issues with input shapes or embedding outputs.
+        """
         x_tensor = torch.tensor(x, dtype=torch.float32)
         if x_tensor.dim() == 3:
             x_tensor = x_tensor.unsqueeze(1)

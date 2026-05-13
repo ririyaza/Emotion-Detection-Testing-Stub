@@ -15,6 +15,10 @@ emotion_to_idx = {e: i for i, e in enumerate(emotion_labels)}
 audio_folder = "./datasets"
 audio_samples = []
 
+"""
+Load Dataset      
+"""
+
 for emotion_dir in os.listdir(audio_folder):
     full_dir = os.path.join(audio_folder, emotion_dir)
     if os.path.isdir(full_dir):
@@ -72,6 +76,9 @@ def seed_all(seed=42):
 seed_all()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+"""
+Validate Labels      
+"""
 valid_samples = [s for s in audio_samples if s["emotion"] in emotion_to_idx]
 unknown_labels = sorted({s["emotion"] for s in audio_samples if s["emotion"] not in emotion_to_idx})
 if unknown_labels:
@@ -80,33 +87,15 @@ if unknown_labels:
 if not valid_samples:
     raise RuntimeError("No audio samples matched expected labels.")
 
-unique_samples = []
-seen_hashes = {}
-dup_count = 0
-cross_label_hash = 0
-for sample in valid_samples:
-    with open(sample["file"], "rb") as f:
-        file_hash = hashlib.sha256(f.read()).hexdigest()
-    if file_hash in seen_hashes:
-        dup_count += 1
-        if seen_hashes[file_hash] != sample["emotion"]:
-            cross_label_hash += 1
-        continue
-    seen_hashes[file_hash] = sample["emotion"]
-    unique_samples.append(sample)
-
-if dup_count > 0:
-    print(f"Removed {dup_count} exact duplicate files for training stability.")
-    if cross_label_hash > 0:
-        print(
-            "Warning: Some duplicate audio files appeared under different labels. "
-            "Kept the first label encountered."
-        )
+unique_samples = valid_samples
 
 print("Extracting embeddings (cached)...")
 features = []
 labels = []
 for sample in unique_samples:
+    """
+    Extract embeddings      
+    """
     emb = get_audio_embedding(sample["file"], verbose=False).squeeze(0)
     features.append(emb)
     labels.append(emotion_to_idx[sample["emotion"]])
@@ -114,6 +103,9 @@ for sample in unique_samples:
 X = torch.stack(features)
 y = torch.tensor(labels, dtype=torch.long)
 
+"""
+Split: 80% train, 20% validation.
+"""
 indices_by_class = defaultdict(list)
 for idx, label in enumerate(labels):
     indices_by_class[label].append(idx)
@@ -135,6 +127,10 @@ y_train = y[train_indices]
 X_val = X[val_indices]
 y_val = y[val_indices]
 
+"""
+Normalization: We compute the mean and standard deviation of the training set features and apply z-score normalization to both the training and validation sets. 
+This ensures that our model trains on data with a consistent scale, which can improve convergence and performance.
+"""
 train_mean = X_train.mean(dim=0, keepdim=True)
 train_std = X_train.std(dim=0, keepdim=True).clamp_min(1e-6)
 X_train = (X_train - train_mean) / train_std
@@ -153,6 +149,9 @@ weights = torch.tensor(
     device=device,
 )
 
+"""
+We use a WeightedRandomSampler to address class imbalance in the training data.
+"""
 sample_weights = torch.tensor(
     [1.0 / max(class_counts.get(label, 1), 1) for label in y_train.tolist()],
     dtype=torch.float32,
