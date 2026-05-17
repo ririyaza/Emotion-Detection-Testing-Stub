@@ -457,53 +457,92 @@ def scenario_step_audio():
     temp_path = f"temp_{uuid.uuid4()}{suffix}"
     audio_file.save(temp_path)
 
-    transcript = None
+    transcript = {"text": "", "error": ""}
     text_from_audio = None
     audio_result = None
     fused = None
+    final_emotion = ""
+
     try:
+        # =========================
+        # 1. AUDIO EMOTION (always runs)
+        # =========================
         audio_embedding = get_audio_embedding(temp_path)
         audio_result = classify_audio(audio_embedding)
+
         duration_sec = get_wav_duration_seconds(temp_path)
+
+        # =========================
+        # 2. STT + TEXT EMOTION (optional)
+        # =========================
         if duration_sec >= MIN_AUDIO_SECONDS:
             transcript = transcribe_audio(temp_path)
+
             if transcript.get("text"):
                 print(f"[SCENARIO] Transcript: {transcript['text']}")
+
                 text_from_audio = classify_text(transcript["text"])
-                print(f"[SCENARIO] Text-from-audio emotion: {text_from_audio.get('emotion')} | confidence: {text_from_audio.get('confidence')}")
+
+                print(
+                    f"[SCENARIO] Text-from-audio emotion: "
+                    f"{text_from_audio.get('emotion')} | confidence: {text_from_audio.get('confidence')}"
+                )
             elif transcript.get("error"):
                 print("STT error:", transcript["error"])
-        if text_from_audio is not None:
+
+        # =========================
+        # 3. FUSION (audio + speech intent)
+        # =========================
+        if text_from_audio:
             fused = fuse_emotions(audio_result, text_from_audio)
+
+        # =========================
+        # 4. FINAL EMOTION DECISION
+        # =========================
+        final_emotion = (
+            (fused or {}).get("emotion")
+            or audio_result.get("emotion")
+            or ""
+        )
+
+        # DEBUG LOGGING
+        print(f"[SCENARIO] Audio emotion: {audio_result.get('emotion')} | confidence: {audio_result.get('confidence')}")
+
+        if fused:
+            print(f"[SCENARIO] Fused emotion: {fused.get('emotion')} | confidence: {fused.get('confidence')}")
+
+        if not final_emotion:
+            print("[SCENARIO] Final emotion empty.")
+
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-    final_emotion = (fused or audio_result or {}).get("emotion", "")
-    if audio_result is not None:
-        print(f"[SCENARIO] Audio emotion: {audio_result.get('emotion')} | confidence: {audio_result.get('confidence')}")
-    if fused is not None:
-        print(f"[SCENARIO] Fused emotion: {fused.get('emotion')} | confidence: {fused.get('confidence')}")
-    if not final_emotion:
-        print("[SCENARIO] Final emotion empty.")
-    user_text = ""
-    if transcript is not None:
-        user_text = transcript.get("text", "")
+    user_text = transcript.get("text", "")
 
+    # =========================
+    # 5. IMPORTANT: SEND EMOTION TO ENGINE
+    # =========================
     payload = {
         "text": user_text,
         "emotion": final_emotion,
+        "audio_emotion": (audio_result or {}).get("emotion"),
+        "text_emotion": (text_from_audio or {}).get("emotion"),
         "selections": {},
         "suds": None
     }
 
     response_payload = scenario_engine.handle_step(session_id, payload)
+
     out = _json_merge_session(session_id, response_payload)
     out.update({
         "transcript": user_text,
         "audio": audio_result,
+        "text_from_audio": text_from_audio,
         "final": fused,
+        "final_emotion": final_emotion
     })
+
     return jsonify(out)
 
 
