@@ -16,11 +16,13 @@ import torch.nn.functional as F
 import uuid
 import wave
 from pathlib import Path
+from datetime import datetime
 from transformers import pipeline
 from transformers.utils import logging as hf_logging
 
 from audio_cnn import get_audio_embedding
 from scenario_engine import ScenarioEngine
+from database import init_emotion_database, get_emotion_database
 
 
 class AudioClassifier(nn.Module):
@@ -73,6 +75,15 @@ audio_classifier_loaded = False
 audio_norm_mean = None
 audio_norm_std = None
 scenario_engine = ScenarioEngine(storage_path="scenario_sessions.json")
+
+# Initialize Firebase for emotion logging
+FIREBASE_CREDS = os.getenv(
+    "FIREBASE_CREDENTIALS",
+    "firebase/hati-25259-firebase-adminsdk-fbsvc-813789fa41.json"
+)
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "hati-25259")
+emotion_db = init_emotion_database(FIREBASE_CREDS, FIREBASE_PROJECT_ID)
+scenario_engine.set_emotion_db(emotion_db)
 
 TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "j-hartmann/emotion-english-distilroberta-base")
 STT_MODEL_NAME = os.getenv("STT_MODEL_NAME", "openai/whisper-small")
@@ -405,6 +416,56 @@ def scenario_start():
     data = request.get_json(silent=True) or {}
     theme = data.get("theme", "")
     scenario_key = data.get("scenario_key", "")
+    user_id = data.get("user_id", "")
+    force_new = data.get("force_new", False)
+    
+    if user_id:
+        scenario_engine.set_user_id(user_id)
+    
+    if user_id and not force_new and hasattr(emotion_db, 'get_unfinished_scenarios'):
+        try:
+            unfinished = emotion_db.get_unfinished_scenarios(user_id)
+            if unfinished:
+                for scenario_id, metadata in unfinished.items():
+                    if (metadata.get("theme") == theme and 
+                        metadata.get("scenario_key") == scenario_key):
+                        print(f"[SCENARIO] Resuming unfinished scenario: {scenario_id}")
+                        current_step = metadata.get("current_step", "scene0_greet")
+                        state = scenario_engine.sessions.get(scenario_id)
+                        if not state and hasattr(scenario_engine, "restore_session_from_db"):
+                            restored = scenario_engine.restore_session_from_db(scenario_id)
+                            if restored:
+                                state = scenario_engine.sessions.get(scenario_id)
+                                print(f"[SCENARIO] Restored session state from DB for {scenario_id}")
+
+                        if state:
+                            history = state.get("history", [])
+                            last_assistant = None
+                            for item in reversed(history):
+                                if item.get("role") == "assistant" and isinstance(item.get("payload"), dict):
+                                    last_assistant = item.get("payload")
+                                    break
+
+                            response = {
+                                "session_id": scenario_id,
+                                "resumed": True,
+                                "step": state.get("step"),
+                                "data": state.get("data", {}),
+                                "history": history,
+                            }
+                            if last_assistant:
+                                response.update(last_assistant)
+                            else:
+                                response.update({
+                                    "messages": ["Resumed your previous scenario session."],
+                                    "message": "Resumed previous scenario session.",
+                                    "ui": {"type": "none"},
+                                })
+                            return jsonify(response)
+        except Exception as e:
+            print(f"[SCENARIO] Resume check error: {e}")
+    
+    # No unfinished scenario found, start a new one
     session_id, payload = scenario_engine.start_session(theme=theme, scenario_key=scenario_key)
     return jsonify(_json_merge_session(session_id, payload))
 
@@ -413,8 +474,13 @@ def scenario_start():
 def scenario_step():
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
+    user_id = data.get("user_id", "")
+    
     if not session_id:
         return jsonify({"error": "session_id required"}), 400
+    
+    if user_id:
+        scenario_engine.set_user_id(user_id)
 
     user_text = (data.get("text") or "").strip()
     emotion = ""
@@ -434,14 +500,34 @@ def scenario_step():
     }
 
     response_payload = scenario_engine.handle_step(session_id, payload)
-    return jsonify(_json_merge_session(session_id, response_payload))
+
+    state = scenario_engine.sessions.get(session_id)
+    response = _json_merge_session(session_id, response_payload)
+    if state is not None:
+        history = state.setdefault("history", [])
+        user_event = {"role": "user", "payload": {"text": user_text}}
+        if data.get("selections") is not None:
+            user_event["payload"]["selections"] = data.get("selections")
+        if data.get("suds") is not None:
+            user_event["payload"]["suds"] = data.get("suds")
+        history.append(user_event)
+        history.append({"role": "assistant", "payload": response_payload})
+        scenario_engine._save(session_id)
+        response["history"] = history
+
+    return jsonify(response)
 
 
 @app.route("/scenario/step_audio", methods=["POST"])
 def scenario_step_audio():
     session_id = request.form.get("session_id")
+    user_id = request.form.get("user_id", "")
+    
     if not session_id:
         return jsonify({"error": "session_id required"}), 400
+    
+    if user_id:
+        scenario_engine.set_user_id(user_id)
 
     audio_file = request.files.get("audio")
     if audio_file is None:
@@ -464,17 +550,13 @@ def scenario_step_audio():
     final_emotion = ""
 
     try:
-        # =========================
-        # 1. AUDIO EMOTION (always runs)
-        # =========================
+  
         audio_embedding = get_audio_embedding(temp_path)
         audio_result = classify_audio(audio_embedding)
 
         duration_sec = get_wav_duration_seconds(temp_path)
 
-        # =========================
-        # 2. STT + TEXT EMOTION (optional)
-        # =========================
+     
         if duration_sec >= MIN_AUDIO_SECONDS:
             transcript = transcribe_audio(temp_path)
 
@@ -490,22 +572,16 @@ def scenario_step_audio():
             elif transcript.get("error"):
                 print("STT error:", transcript["error"])
 
-        # =========================
-        # 3. FUSION (audio + speech intent)
-        # =========================
         if text_from_audio:
             fused = fuse_emotions(audio_result, text_from_audio)
 
-        # =========================
-        # 4. FINAL EMOTION DECISION
-        # =========================
+      
         final_emotion = (
             (fused or {}).get("emotion")
             or audio_result.get("emotion")
             or ""
         )
 
-        # DEBUG LOGGING
         print(f"[SCENARIO] Audio emotion: {audio_result.get('emotion')} | confidence: {audio_result.get('confidence')}")
 
         if fused:
@@ -520,9 +596,7 @@ def scenario_step_audio():
 
     user_text = transcript.get("text", "")
 
-    # =========================
-    # 5. IMPORTANT: SEND EMOTION TO ENGINE
-    # =========================
+ 
     payload = {
         "text": user_text,
         "emotion": final_emotion,
@@ -542,6 +616,23 @@ def scenario_step_audio():
         "final": fused,
         "final_emotion": final_emotion
     })
+
+    state = scenario_engine.sessions.get(session_id)
+    if state is not None:
+        history = state.setdefault("history", [])
+        user_event = {
+            "role": "user",
+            "payload": {
+                "audio": True,
+                "transcript": user_text,
+                "audio_emotion": (audio_result or {}).get("emotion"),
+                "text_emotion": (text_from_audio or {}).get("emotion")
+            }
+        }
+        history.append(user_event)
+        history.append({"role": "assistant", "payload": response_payload})
+        scenario_engine._save(session_id)
+        out["history"] = history
 
     return jsonify(out)
 

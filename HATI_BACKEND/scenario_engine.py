@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import uuid
+from datetime import datetime
 
 THEME_SCENARIO_KEYS = {
     "Fear of Authority": "foa_supervisor",
@@ -22,16 +24,165 @@ ALLOWED_SCENARIO_KEYS = {
 }
 
 
+IGNORE_USER_RESPONSES = {
+    "begin",
+    "continue",
+    "approach",
+    "i'm done practicing my line",
+    "yes",
+    "no",
+    "maybe later",
+    "finish",
+    "open progress",
+    "close",
+}
+
 class ScenarioEngine:
     """
     Scripted scenario engine with branching and UI hints (buttons/text_input).
     Persists sessions to a JSON file for simple restarts.
     """
 
-    def __init__(self, storage_path="scenario_sessions.json"):
+    def __init__(self, storage_path="scenario_sessions.json", emotion_db=None, user_id=None):
         self.storage_path = storage_path
         self.sessions = {}
+        self.emotion_db = emotion_db
+        self.user_id = user_id
         self._load()
+
+    def set_user_id(self, user_id):
+        """Set the user ID for emotion logging."""
+        self.user_id = user_id
+    
+    def set_emotion_db(self, emotion_db):
+        """Set the emotion database instance for logging."""
+        self.emotion_db = emotion_db
+    
+    def _update_step_in_db(self, session_id):
+        """Update the stored scenario state in Firebase for this session."""
+        if not self.emotion_db or not self.user_id:
+            return False
+        
+        state = self.sessions.get(session_id)
+        if not state:
+            return False
+        
+        try:
+            if hasattr(self.emotion_db, "update_scenario_state"):
+                return self.emotion_db.update_scenario_state(self.user_id, session_id, state)
+            return self.emotion_db.update_scenario_step(self.user_id, session_id, state.get("step", ""))
+        except Exception as e:
+            print(f"_update_step_in_db: error updating step {e}")
+            return False
+
+    def _ensure_history(self, session_id):
+        state = self.sessions.get(session_id)
+        if state is None:
+            return
+        if not isinstance(state.get("history"), list):
+            state["history"] = []
+
+    def _append_history(self, session_id, event):
+        self._ensure_history(session_id)
+        state = self.sessions.get(session_id)
+        if state is not None:
+            state["history"].append(event)
+
+    def _normalize_emotion_label(self, emotion):
+        if not emotion:
+            return None
+        label = str(emotion).strip().lower()
+        if label in {"angry", "anger"}:
+            return "anger"
+        if label in {"fear", "fearful", "scared", "afraid"}:
+            return "anxious"
+        if label in {"joy", "joyful", "happy", "love"}:
+            return "happy"
+        if label in {"sadness", "sad", "depressed"}:
+            return "sad"
+        if label in {"surprise", "surprised"}:
+            return "surprised"
+        if label in {"disgust", "disgusted"}:
+            return "disgust"
+        if label in {"neutral", "calm", "okay", "meh"}:
+            return "neutral"
+        return label
+
+    def _get_scenario_emotion_summary(self, session_id):
+        if not self.emotion_db or not self.user_id or not hasattr(self.emotion_db, "get_emotion_logs"):
+            return None
+
+        logs = self.emotion_db.get_emotion_logs(self.user_id, session_id)
+        if not logs:
+            return None
+
+        counts = {}
+        for log in logs.values():
+            emotion = self._normalize_emotion_label(log.get("emotion"))
+            if not emotion:
+                continue
+            counts[emotion] = counts.get(emotion, 0) + 1
+
+        if not counts:
+            return None
+
+        return sorted(counts.items(), key=lambda item: item[1], reverse=True)
+
+    def restore_session_from_db(self, session_id):
+        """Restore a scenario session state from Firebase if available."""
+        if not self.emotion_db or not self.user_id or not hasattr(self.emotion_db, "get_scenario_state"):
+            return False
+
+        try:
+            saved_state = self.emotion_db.get_scenario_state(self.user_id, session_id)
+            if isinstance(saved_state, dict):
+                self.sessions[session_id] = saved_state
+                return True
+        except Exception as e:
+            print(f"restore_session_from_db: error restoring session {e}")
+        return False
+
+    def _log_emotion(self, session_id, emotion, step, user_response="", story_branch="", confidence=None, theme="", scenario_key=""):
+        """
+        Log an emotion event to Firebase.
+        
+        Args:
+            session_id: Scenario session ID
+            emotion: The detected or provided emotion
+            step: Current scenario step
+            user_response: User's input/response text
+            story_branch: Story branch taken
+            confidence: Confidence score (0-1)
+            theme: Scenario theme
+            scenario_key: Scenario key identifier
+        """
+        if not self.emotion_db or not self.user_id:
+            return
+
+        normalized_response = (user_response or "").strip()
+        if normalized_response:
+            lowered = normalized_response.lower()
+            if lowered in IGNORE_USER_RESPONSES or re.fullmatch(r"(?:[1-9]|10)", lowered):
+                return
+
+        emotion_data = {
+            'emotion': emotion,
+            'step': step,
+            'theme': theme,
+            'scenario_key': scenario_key,
+            'user_response': user_response[:500] if user_response else "",  
+            'story_branch': story_branch,
+            'timestamp': datetime.now().isoformat(),
+            'audio_detected': False
+        }
+        
+        if confidence is not None:
+            emotion_data['confidence'] = round(float(confidence), 3)
+        
+        try:
+            result = self.emotion_db.log_emotion(self.user_id, session_id, emotion_data)
+        except Exception as e:
+            print(f"_log_emotion error: {e}")
 
     def set_renderer(self, renderer):
         return None
@@ -44,8 +195,26 @@ class ScenarioEngine:
         self.sessions[session_id] = {
             "step": "scene0_greet",
             "data": {"theme": theme_key, "scenario_key": sk, "user_name": name},
+            "history": [],
         }
+        payload = self._scene0_pre_scenario(theme_key, sk, name)
+        self._append_history(session_id, {"role": "assistant", "payload": payload})
         self._save()
+        if self.emotion_db and self.user_id:
+            metadata = {
+                "created_at": datetime.now().isoformat(),
+                "theme": theme_key,
+                "scenario_key": sk,
+                "current_step": "scene0_greet",
+                "session_state": self.sessions[session_id],
+            }
+            try:
+                if hasattr(self.emotion_db, "create_scenario"):
+                    created = self.emotion_db.create_scenario(self.user_id, session_id, metadata)
+                else:
+                    print("Warning: emotion_db has no create_scenario method; skipping initial scenario metadata write.")
+            except Exception as e:
+                print(f"start_session DB write error: {e}")
         return session_id, self._scene0_pre_scenario(theme_key, sk, name)
 
     def handle_step(self, session_id, payload):
@@ -62,10 +231,20 @@ class ScenarioEngine:
                 data["user_name"] = incoming_name
         if payload and "emotion" in payload:
             data["emotion"] = (payload.get("emotion") or "").strip()
+            emotion_confidence = payload.get("confidence")
+            self._log_emotion(
+                session_id,
+                data["emotion"],
+                step,
+                user_response=user_text,
+                confidence=emotion_confidence,
+                theme=data.get("theme", ""),
+                scenario_key=data.get("scenario_key", "")
+            )
 
         if step == "scene0_greet":
             state["step"] = "pies_physical"
-            self._save()
+            self._save(session_id)
             return self._scene1_intro(
                 data.get("theme", ""),
                 data.get("scenario_key", ""),
@@ -74,20 +253,20 @@ class ScenarioEngine:
         if step == "pies_physical":
             data["pies_physical"] = user_text
             state["step"] = "pies_emotional"
-            self._save()
+            self._save(session_id)
             return self._pies_emotional(data)
 
         if step == "pies_emotional":
             data["pies_emotional"] = user_text
             state["step"] = "pies_environmental"
-            self._save()
+            self._save(session_id)
             return self._pies_environmental(data)
 
         if step == "pies_environmental":
             data["pies_environmental"] = user_text
             nxt, out = self._after_pies_environmental(data)
             state["step"] = nxt
-            self._save()
+            self._save(session_id)
             return out
 
         # --- Fear of Authority: Professor's Signature ---
@@ -96,30 +275,30 @@ class ScenarioEngine:
             ut = user_text.lower()
             if ut.startswith("c:") or "i'll type" in ut or "type my own" in ut or ut.startswith("custom"):
                 state["step"] = "foa_s2_script_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["**Hati:** Type the line you'll say to the professor:"],
                     {"type": "text_input", "placeholder": "Your line..."},
                 )
             state["step"] = "foa_s2_q_prep"
-            self._save()
+            self._save(session_id)
             return self._foa_s2_q_prep_view()
 
         if step == "foa_s2_script_custom":
             data["foa_script_custom"] = user_text
             state["step"] = "foa_s2_q_prep"
-            self._save()
+            self._save(session_id)
             return self._foa_s2_q_prep_view()
 
         if step == "foa_s2_q_prep":
             data["foa_q_prep"] = user_text
             state["step"] = "foa_s2_ready"
-            self._save()
+            self._save(session_id)
             return self._foa_s2_ready_view()
 
         if step == "foa_s2_ready":
             state["step"] = "foa_s3_npc"
-            self._save()
+            self._save(session_id)
             return self._foa_s3_npc_view()
 
         if step == "foa_s3_npc":
@@ -128,7 +307,16 @@ class ScenarioEngine:
             data["story_branch"] = self._foa_story_branch(user_text, data.get("emotion", ""))
             data["foa_r_phase"] = 0
             state["step"] = "foa_s3_reaction"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "foa_s3_npc",
+                user_response=user_text,
+                story_branch=data["story_branch"],
+                theme=data.get("theme", ""),
+                scenario_key=data.get("scenario_key", "")
+            )
             return self._foa_s3_reaction_enter(data)
 
         if step == "foa_s3_custom":
@@ -136,29 +324,29 @@ class ScenarioEngine:
             data["story_branch"] = self._foa_story_branch(user_text, data.get("emotion", ""))
             data["foa_r_phase"] = 0
             state["step"] = "foa_s3_reaction"
-            self._save()
+            self._save(session_id)
             return self._foa_s3_reaction_enter(data)
 
         if step == "foa_s3_reaction":
             out = self._advance_foa_s3_reaction(state, data, user_text)
-            self._save()
+            self._save(session_id)
             return out
 
         # --- Fear of Strangers: Food Hall ---
         if step == "fsn_s2_practice":
             state["step"] = "fsn_s2_goal"
-            self._save()
+            self._save(session_id)
             return self._fsn_s2_goal_prompt_view()
 
         if step == "fsn_s2_goal":
             data["goal_text"] = user_text
             state["step"] = "fsn_s2_ready"
-            self._save()
+            self._save(session_id)
             return self._fsn_s2_ready_view()
 
         if step == "fsn_s2_ready":
             state["step"] = "fsn_s3_npc"
-            self._save()
+            self._save(session_id)
             return self._fsn_s3_npc_view()
 
         if step == "fsn_s3_npc":
@@ -167,7 +355,16 @@ class ScenarioEngine:
             data["story_branch"] = self._fsn_story_branch(user_text, data.get("emotion", ""))
             data["fsn_r_phase"] = 0
             state["step"] = "fsn_s3_reaction"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "fsn_s3_npc",
+                user_response=user_text,
+                story_branch=data["story_branch"],
+                theme=data.get("theme", ""),
+                scenario_key=data.get("scenario_key", "")
+            )
             return self._fsn_s3_reaction_enter(data)
 
         if step == "fsn_s3_custom":
@@ -175,80 +372,89 @@ class ScenarioEngine:
             data["story_branch"] = self._fsn_story_branch(user_text, data.get("emotion", ""))
             data["fsn_r_phase"] = 0
             state["step"] = "fsn_s3_reaction"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "fsn_s3_custom",
+                user_response=user_text,
+                story_branch=data["story_branch"],
+                theme=data.get("theme", ""),
+                scenario_key=data.get("scenario_key", "")
+            )
             return self._fsn_s3_reaction_enter(data)
 
         if step == "fsn_s3_reaction":
             out = self._advance_fsn_s3_reaction(state, data, user_text)
-            self._save()
+            self._save(session_id)
             return out
 
         # --- Thesis defense (observed / performing) ---
         if step == "fbop_s2_title":
             data["fbop_title"] = user_text
             state["step"] = "fbop_s2_opening"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_opening_view(data)
 
         if step == "fbop_s2_opening":
             data["fbop_opening_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fbop_s2_opening_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your opening line:"],
                     {"type": "text_input", "placeholder": "Opening..."},
                 )
             state["step"] = "fbop_s2_pause"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_pause_view()
 
         if step == "fbop_s2_opening_custom":
             data["fbop_opening_custom"] = user_text
             state["step"] = "fbop_s2_pause"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_pause_view()
 
         if step == "fbop_s2_pause":
             state["step"] = "fbop_s2_contrib"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_contrib_view()
 
         if step == "fbop_s2_contrib":
             data["fbop_contrib"] = user_text
             state["step"] = "fbop_s2_goal"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_goal_view()
 
         if step == "fbop_s2_goal":
             data["fbop_goal_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fbop_s2_goal_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your small win goal:"],
                     {"type": "text_input", "placeholder": "Goal..."},
                 )
             data["goal_text"] = user_text
             state["step"] = "fbop_s2_ground"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_ground_view()
 
         if step == "fbop_s2_goal_custom":
             data["goal_text"] = user_text
             state["step"] = "fbop_s2_ground"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_ground_view()
 
         if step == "fbop_s2_ground":
             data["fbop_ground"] = user_text
             state["step"] = "fbop_s2_ready"
-            self._save()
+            self._save(session_id)
             return self._fbop_s2_ready_view()
 
         if step == "fbop_s2_ready":
             state["step"] = "fbop_s3_delivery"
-            self._save()
+            self._save(session_id)
             return self._fbop_s3_delivery_view()
 
         if step == "fbop_s3_delivery":
@@ -256,12 +462,19 @@ class ScenarioEngine:
             data["story_branch"] = self._fbop_story_branch(user_text, data.get("emotion", ""))
             data["fbop_o_phase"] = 0
             state["step"] = "fbop_s3_outcome"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "fbop_s3_delivery",
+                user_response=user_text,
+                story_branch=data["story_branch"]
+            )
             return self._fbop_s3_outcome_enter(data)
 
         if step == "fbop_s3_outcome":
             out = self._advance_fbop_s3_outcome(state, data, user_text)
-            self._save()
+            self._save(session_id)
             return out
 
         # --- House party (social gatherings) ---
@@ -269,91 +482,91 @@ class ScenarioEngine:
             data["fsg_path"] = user_text
             if "path b" in user_text.lower() or "corner" in user_text.lower() or "b)" in user_text.lower():
                 state["step"] = "fsg_b_goal"
-                self._save()
+                self._save(session_id)
                 return self._fsg_b_goal_view()
             state["step"] = "fsg_a_opening"
-            self._save()
+            self._save(session_id)
             return self._fsg_a_opening_view(data)
 
         if step == "fsg_a_opening":
             data["fsg_open_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fsg_a_opening_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your opening line:"],
                     {"type": "text_input", "placeholder": "Opening..."},
                 )
             state["step"] = "fsg_a_practice_pause"
-            self._save()
+            self._save(session_id)
             return self._fsg_a_practice_pause_view()
 
         if step == "fsg_a_opening_custom":
             data["fsg_open_custom"] = user_text
             state["step"] = "fsg_a_practice_pause"
-            self._save()
+            self._save(session_id)
             return self._fsg_a_practice_pause_view()
 
         if step == "fsg_a_practice_pause":
             state["step"] = "fsg_a_relation"
-            self._save()
+            self._save(session_id)
             return self._fsg_a_relation_view()
 
         if step == "fsg_a_relation":
             data["fsg_relation"] = user_text
             state["step"] = "fsg_a_goal"
-            self._save()
+            self._save(session_id)
             return self._fsg_a_goal_view()
 
         if step == "fsg_a_goal":
             data["fsg_goal_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fsg_a_goal_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your small win goal:"],
                     {"type": "text_input", "placeholder": "Goal..."},
                 )
             data["goal_text"] = user_text
             state["step"] = "fsg_ground"
-            self._save()
+            self._save(session_id)
             return self._fsg_ground_view()
 
         if step == "fsg_a_goal_custom":
             data["goal_text"] = user_text
             state["step"] = "fsg_ground"
-            self._save()
+            self._save(session_id)
             return self._fsg_ground_view()
 
         if step == "fsg_b_goal":
             data["fsg_b_goal_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fsg_b_goal_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your small win goal:"],
                     {"type": "text_input", "placeholder": "Goal..."},
                 )
             data["goal_text"] = user_text
             state["step"] = "fsg_ground"
-            self._save()
+            self._save(session_id)
             return self._fsg_ground_view()
 
         if step == "fsg_b_goal_custom":
             data["goal_text"] = user_text
             state["step"] = "fsg_ground"
-            self._save()
+            self._save(session_id)
             return self._fsg_ground_view()
 
         if step == "fsg_ground":
             data["fsg_ground"] = user_text
             state["step"] = "fsg_s2_proceed"
-            self._save()
+            self._save(session_id)
             return self._fsg_s2_proceed_view()
 
         if step == "fsg_s2_proceed":
             state["step"] = "fsg_s3_social"
-            self._save()
+            self._save(session_id)
             return self._fsg_s3_social_view(data)
 
         if step == "fsg_s3_social":
@@ -379,12 +592,19 @@ class ScenarioEngine:
                 data.pop("fsg_opening_flow", None)
             data["fsg_rx_ph"] = 0
             state["step"] = "fsg_s3_reaction"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "fsg_s3_social",
+                user_response=user_text,
+                story_branch=data["story_branch"]
+            )
             return self._advance_fsg_s3_reaction(state, data, None)
 
         if step == "fsg_s3_reaction":
             out = self._advance_fsg_s3_reaction(state, data, user_text)
-            self._save()
+            self._save(session_id)
             return out
 
         # --- Group project (negative evaluation) ---
@@ -392,61 +612,67 @@ class ScenarioEngine:
             data["fne_style_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fne_s2_style_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type how you'll open your part:"],
                     {"type": "text_input", "placeholder": "Your opening..."},
                 )
             state["step"] = "fne_s2_pause"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_pause_view()
 
         if step == "fne_s2_style_custom":
             data["fne_style_custom"] = user_text
             state["step"] = "fne_s2_pause"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_pause_view()
 
         if step == "fne_s2_pause":
             state["step"] = "fne_s2_points"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_points_view()
 
         if step == "fne_s2_points":
             data["fne_points"] = user_text
             state["step"] = "fne_s2_goal"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_goal_view()
 
         if step == "fne_s2_goal":
             data["fne_goal_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "fne_s2_goal_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your small win goal:"],
                     {"type": "text_input", "placeholder": "Goal..."},
                 )
             data["goal_text"] = user_text
             state["step"] = "fne_s2_ground"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_ground_view()
 
         if step == "fne_s2_goal_custom":
             data["goal_text"] = user_text
             state["step"] = "fne_s2_ground"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_ground_view()
 
         if step == "fne_s2_ground":
             data["fne_ground"] = user_text
             state["step"] = "fne_s2_ready"
-            self._save()
+            self._save(session_id)
             return self._fne_s2_ready_view()
 
         if step == "fne_s2_ready":
+            state["step"] = "fne_s3_delivery"
+            self._save(session_id)
+            return self._fne_s3_delivery_view()
+        
+        if step == "fne_s3_delivery":
+            data["fne_delivery"] = user_text
             state["step"] = "fne_s3_carlo"
-            self._save()
+            self._save(session_id)
             return self._fne_s3_carlo_view()
 
         if step == "fne_s3_carlo":
@@ -454,7 +680,14 @@ class ScenarioEngine:
             data["story_branch"] = self._fne_story_branch(user_text, data.get("emotion", ""))
             data["fne_outcome_phase"] = 0
             state["step"] = "fne_s3_outcome"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "fne_s3_carlo",
+                user_response=user_text,
+                story_branch=data["story_branch"]
+            )
             return self._fne_s3_outcome_view(data)
 
         if step == "fne_s3_outcome":
@@ -466,14 +699,14 @@ class ScenarioEngine:
                     ut = (user_text or "").lower()
                     if "friday" in ut or "move on" in ut:
                         msgs = [
-                            "Carlo: Alright.",
-                            "Precious: I think we can work with that timeline.",
-                            "Julia: Let's keep going.",
+                            "**Carlo:** Alright.",
+                            "**Precious:** I think we can work with that timeline.",
+                            "**Julia:** Let's keep going.",
                         ]
                     else:
                         msgs = [
-                            "Carlo: Okay.",
-                            "Precious: Let's change the subject for a minute.",
+                            "**Carlo:** Okay.",
+                            "**Precious:** Let's change the subject for a minute.",
                         ]
                     return self._payload(
                         msgs
@@ -483,10 +716,10 @@ class ScenarioEngine:
                         {"type": "buttons", "options": ["Continue"]},
                     )
                 state["step"] = "scene4_debrief_intro"
-                self._save()
+                self._save(session_id)
                 return self._scene4_debrief_intro(data)
             state["step"] = "scene4_debrief_intro"
-            self._save()
+            self._save(session_id)
             return self._scene4_debrief_intro(data)
 
         # --- Physiological / bus stop ---
@@ -494,62 +727,62 @@ class ScenarioEngine:
             data["phys_excuse_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "phys_s2_excuse_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your line:"],
                     {"type": "text_input", "placeholder": "Your line..."},
                 )
             state["step"] = "phys_s2_ack"
-            self._save()
+            self._save(session_id)
             return self._phys_s2_ack_view()
 
         if step == "phys_s2_excuse_custom":
             data["phys_excuse_custom"] = user_text
             state["step"] = "phys_s2_ack"
-            self._save()
+            self._save(session_id)
             return self._phys_s2_ack_view()
 
         if step == "phys_s2_ack":
             state["step"] = "phys_s2_goal"
-            self._save()
+            self._save(session_id)
             return self._phys_s2_goal_view()
 
         if step == "phys_s2_goal":
             data["phys_goal_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "phys_s2_goal_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your small win goal:"],
                     {"type": "text_input", "placeholder": "Goal..."},
                 )
             data["goal_text"] = user_text
             state["step"] = "phys_s2_ground"
-            self._save()
+            self._save(session_id)
             return self._phys_s2_ground_view()
 
         if step == "phys_s2_goal_custom":
             data["goal_text"] = user_text
             state["step"] = "phys_s2_ground"
-            self._save()
+            self._save(session_id)
             return self._phys_s2_ground_view()
 
         if step == "phys_s2_ground":
             data["phys_ground"] = user_text
             state["step"] = "phys_s2_ready"
-            self._save()
+            self._save(session_id)
             return self._phys_s2_ready_view()
 
         if step == "phys_s2_ready":
             state["step"] = "phys_s3_classmate"
-            self._save()
+            self._save(session_id)
             return self._phys_s3_classmate_view()
 
         if step == "phys_s3_classmate":
             data["phys_reply_pick"] = user_text
             if "custom" in user_text.lower():
                 state["step"] = "phys_s3_custom"
-                self._save()
+                self._save(session_id)
                 return self._payload(
                     ["Type your reply:"],
                     {"type": "text_input", "placeholder": "Reply..."},
@@ -558,7 +791,14 @@ class ScenarioEngine:
             data["story_branch"] = self._phys_story_branch(user_text, data.get("emotion", ""))
             data["phys_r_ph"] = 0
             state["step"] = "phys_s3_reaction"
-            self._save()
+            self._save(session_id)
+            self._log_emotion(
+                session_id,
+                data.get("emotion", ""),
+                "phys_s3_classmate",
+                user_response=user_text,
+                story_branch=data["story_branch"]
+            )
             return self._advance_phys_s3_reaction(state, data, None)
 
         if step == "phys_s3_custom":
@@ -566,19 +806,19 @@ class ScenarioEngine:
             data["story_branch"] = self._phys_story_branch(user_text, data.get("emotion", ""))
             data["phys_r_ph"] = 0
             state["step"] = "phys_s3_reaction"
-            self._save()
+            self._save(session_id)
             return self._advance_phys_s3_reaction(state, data, None)
 
         if step == "phys_s3_reaction":
             out = self._advance_phys_s3_reaction(state, data, user_text)
-            self._save()
+            self._save(session_id)
             return out
 
         # --- WHERE TO SIT / generic seat flow (foa_classroom) ---
         if step == "scene2_goal":
             data["goal_text"] = user_text
             state["step"] = "scene2_line_choice"
-            self._save()
+            self._save(session_id)
             return self._scene2_line_choice(data)
 
         if step == "scene2_line_choice":
@@ -586,21 +826,21 @@ class ScenarioEngine:
             ut = user_text.lower()
             if ut.startswith("custom") or "type my own" in ut or "i'll type" in ut:
                 state["step"] = "scene2_line_custom"
-                self._save()
+                self._save(session_id)
                 return self._scene2_line_custom()
             state["step"] = "scene2_ready"
-            self._save()
+            self._save(session_id)
             return self._scene2_ready(data)
 
         if step == "scene2_line_custom":
             data["line_custom"] = user_text
             state["step"] = "scene2_ready"
-            self._save()
+            self._save(session_id)
             return self._scene2_ready(data)
 
         if step == "scene2_ready":
             state["step"] = "scene3_npc_prompt"
-            self._save()
+            self._save(session_id)
             return self._scene3_npc_prompt(data)
 
         if step == "scene3_npc_prompt":
@@ -610,7 +850,7 @@ class ScenarioEngine:
             data["npc_branch"] = branch
             data["story_branch"] = "anxious" if branch == "high_anxiety" else ("confident" if branch == "risk" else "freeze")
             state["step"] = "scene3_npc_reaction"
-            self._save()
+            self._save(session_id)
             return self._scene3_npc_reaction(data, branch)
 
         if step == "scene3_user_response":
@@ -619,7 +859,7 @@ class ScenarioEngine:
             data["npc_branch"] = branch
             data["story_branch"] = "anxious" if branch == "high_anxiety" else ("confident" if branch == "risk" else "freeze")
             state["step"] = "scene3_npc_reaction"
-            self._save()
+            self._save(session_id)
             return self._scene3_npc_reaction(data, branch)
 
         if step == "scene3_npc_reaction":
@@ -629,24 +869,24 @@ class ScenarioEngine:
                 ut = user_text.lower()
                 if "try again" in ut:
                     state["step"] = "scene3_npc_prompt"
-                    self._save()
+                    self._save(session_id)
                     return self._scene3_npc_prompt(data)
                 state["step"] = "scene4_debrief_intro"
-                self._save()
+                self._save(session_id)
                 return self._scene4_debrief_intro(data)
             state["step"] = "scene4_debrief_intro"
-            self._save()
+            self._save(session_id)
             return self._scene4_debrief_intro(data)
 
         if step == "scene4_debrief_intro":
             state["step"] = "scene4_predicted"
-            self._save()
+            self._save(session_id)
             return self._scene4_predicted(data)
 
         if step == "scene4_predicted":
             data["predicted_anxiety"] = self._parse_number(user_text)
             state["step"] = "scene4_actual"
-            self._save()
+            self._save(session_id)
             return self._scene4_actual(data)
 
         if step == "scene4_actual":
@@ -654,129 +894,173 @@ class ScenarioEngine:
             theme = data.get("theme", "")
             if theme == "Fear of Social Gatherings":
                 state["step"] = "scene4_fsg_cause"
-                self._save()
+                self._save(session_id)
                 return self._scene4_fsg_cause()
             if theme == "Fear of Negative Evaluation & Embarrassment":
                 state["step"] = "scene4_fne_observe"
-                self._save()
+                self._save(session_id)
                 return self._scene4_fne_observe()
             state["step"] = "scene4_bad"
-            self._save()
+            self._save(session_id)
             return self._scene4_bad()
 
         if step == "scene4_fsg_cause":
             data["fsg_cause"] = user_text
             state["step"] = "scene4_bad"
-            self._save()
+            self._save(session_id)
             return self._scene4_bad()
 
         if step == "scene4_fne_observe":
             data["fne_outcome_observe"] = user_text
             state["step"] = "scene4_fne_severity"
-            self._save()
+            self._save(session_id)
             return self._scene4_fne_severity()
 
         if step == "scene4_fne_severity":
             data["fne_outcome_severity"] = self._parse_number(user_text)
             state["step"] = "scene4_fne_goal_done"
-            self._save()
+            self._save(session_id)
             return self._scene4_fne_goal_done_view(data)
 
         if step == "scene4_fne_goal_done":
             data["fne_goal_achieved"] = user_text
             state["step"] = "scene4_credit"
-            self._save()
+            self._save(session_id)
             return self._scene4_credit()
 
         if step == "scene4_bad":
             data["bad_happened"] = user_text
             if user_text.lower().startswith("y"):
                 state["step"] = "scene4_bad_detail"
-                self._save()
+                self._save(session_id)
                 return self._scene4_bad_detail()
             if data.get("theme") == "Fear of Social Gatherings":
                 state["step"] = "scene4_fsg_goal_done"
-                self._save()
+                self._save(session_id)
                 return self._scene4_fsg_goal_done_view(data)
             state["step"] = "scene4_credit"
-            self._save()
+            self._save(session_id)
             return self._scene4_credit()
 
         if step == "scene4_bad_detail":
             data["bad_detail"] = user_text
             if data.get("theme") == "Fear of Social Gatherings":
                 state["step"] = "scene4_fsg_badness"
-                self._save()
+                self._save(session_id)
                 return self._scene4_fsg_badness()
             state["step"] = "scene4_credit"
-            self._save()
+            self._save(session_id)
             return self._scene4_credit()
 
         if step == "scene4_fsg_badness":
             data["fsg_badness"] = self._parse_number(user_text)
             state["step"] = "scene4_fsg_goal_done"
-            self._save()
+            self._save(session_id)
             return self._scene4_fsg_goal_done_view(data)
 
         if step == "scene4_fsg_goal_done":
             data["fsg_goal_achieved"] = user_text
             state["step"] = "scene4_credit"
-            self._save()
+            self._save(session_id)
             return self._scene4_credit()
 
         if step == "scene4_credit":
             data["credit"] = user_text
             state["step"] = "scene4_personalized"
-            self._save()
+            self._save(session_id)
             return self._scene4_personalized(data)
 
         if step == "scene4_personalized":
             if data.get("scenario_key") == "fsn_classroom":
                 state["step"] = "scene4_class_npc_reflect"
-                self._save()
+                self._save(session_id)
                 return self._scene4_class_npc_reflect_view()
-            state["step"] = "scene4_reflection"
-            self._save()
-            return self._scene4_reflection(data)
+
+            reflection_themes = {
+                "Fear of Negative Evaluation & Embarrassment",
+                "Physiological Symptoms"
+            }
+
+            if data.get("theme") in reflection_themes:
+                state["step"] = "scene4_reflection"
+                self._save(session_id)
+                return self._scene4_reflection(data)
+
+            state["step"] = "scene5_coping"
+            self._save(session_id)
+            return self._scene5_coping(data)
 
         if step == "scene4_class_npc_reflect":
             lt = (user_text or "").strip().lower()
             if lt and lt != "skip":
                 data["class_npc_reflection"] = user_text
             state["step"] = "scene4_class_npc_done"
-            self._save()
+            self._save(session_id)
             return self._payload(
                 [
-                    "**Hati:** That's a really important observation. Keep noticing that pattern—your predictions are often worse than reality.",
+                    "**Hati:** That's a really important observation. Keep noticing that pattern—your **predictions** are often worse than **reality**.",
                 ],
                 {"type": "buttons", "options": ["Continue"]},
             )
 
         if step == "scene4_class_npc_done":
             state["step"] = "scene5_coping"
-            self._save()
+            self._save(session_id)
             return self._scene5_coping(data)
 
         if step == "scene4_reflection":
             data["reflection"] = user_text
             state["step"] = "scene5_coping"
-            self._save()
+            self._save(session_id)
             return self._scene5_coping(data)
 
         if step == "scene5_coping":
+            if (user_text or "").strip().lower() == "yes":
+                state["step"] = "scene5_coping_done"
+                self._save(session_id)
+                return self._payload(
+                    [
+                        "**Hati:** Great. Try it now, and when you are done, let me know.",
+                    ],
+                    {"type": "buttons", "options": ["I'm done"]},
+                )
             data["coping_try"] = user_text
             state["step"] = "scene6_closing"
-            self._save()
+            self._save(session_id)
+            return self._scene6_closing(data)
+
+        if step == "scene5_coping_done":
+            data["coping_try"] = "tried_by_self"
+            state["step"] = "scene6_closing"
+            self._save(session_id)
             return self._scene6_closing(data)
 
         if step == "scene6_closing":
             state["step"] = "scene7_dashboard"
-            self._save()
+            self._save(session_id)
             return self._complete_and_dashboard(data)
 
         if step == "scene7_dashboard":
+            action = (user_text or "").strip().lower()
+            if not action and payload:
+                raw_selections = payload.get("selections")
+                if isinstance(raw_selections, str):
+                    action = raw_selections.strip().lower()
+                elif isinstance(raw_selections, dict):
+                    action = " ".join(str(v) for v in raw_selections.values()).lower()
+
+            if action == "open progress":
+                summary = self._get_scenario_emotion_summary(session_id)
+                if summary:
+                    self._save(session_id)
+                    return self._payload([], {"type": "buttons", "options": ["Close"]})
+
+                print(f"[PROGRESS SUMMARY] No emotion logs found for session {session_id}")
+                self._save(session_id)
+                return self._payload([], {"type": "buttons", "options": ["Close"]})
+
             state["step"] = "complete"
-            self._save()
+            self._save(session_id)
             return self._end()
 
         return {"error": "scenario complete"}
@@ -810,7 +1094,7 @@ class ScenarioEngine:
             return self._payload(messages, {"type": "buttons", "options": ["Begin"]})
         if theme == "Fear of Being Observed & Performing":
             messages = [
-                f"**Hati:** Hi, {n}. Today's scenario is a big one: presenting your research objectives to a thesis panel. This is a classic performance situation. The fear is real, but you can practice handling it. I'll be right here with you.",
+                f"**Hati:** Hi, {n}. Today's scenario is a big one: presenting your project objectives to a thesis panel. This is a classic performance situation. The fear is real, but you can practice handling it. I'll be right here with you.",
             ]
             return self._payload(messages, {"type": "buttons", "options": ["Begin"]})
         if theme == "Fear of Social Gatherings":
@@ -876,7 +1160,7 @@ class ScenarioEngine:
                 "**Hati:** Before we do anything, let's check in with yourself. This is called a Physical, Intellectual, Emotional, and Social check—it just means noticing what's happening in your body and mind right now.",
             ],
             "foa_supervisor": [
-                "**Hati:** You've just entered the department office. The professor is at their desk, talking to another student. They look focused, maybe a bit impatient. You need their signature on your data collection request form. You're waiting for your turn.",
+                "**Hati:** You've just entered the department office. The professor is at their desk, talking to another student. They look focused, maybe a bit impatient. You need their signature on your class requirement form. You're waiting for your turn.",
                 "**Hati:** Before we go further, let's do a quick Physical, Intellectual, Emotional, and Social check—notice what's happening in your body and mind.",
             ],
             "fne_stage": [
@@ -893,7 +1177,7 @@ class ScenarioEngine:
             ],
             "fsg_party": [
                 "**Hati:** You've just walked into the party. The birthday friend waves at you from across the room but is immediately pulled into another conversation. You're on your own for now.",
-                "**Hati:** Looking around, you see: Group A (three friendly-looking people) - They're laughing, standing near the snacks. One woman makes brief eye contact with you and smiles slightly. The empty corner - A quiet chair with a lamp, away from everyone. Safe, but isolated. Other small groups - People talking, not obviously inviting.",
+                "**Hati:** Looking around, you see: Three friendly-looking people - They're laughing, standing near the snacks. One woman makes brief eye contact with you and smiles slightly. There's also the empty corner - A quiet chair with a lamp, away from everyone. Safe, but isolated. There's also other small groups - People talking, not obviously inviting.",
                 "**Hati:** You have a choice: approach the friendly group and introduce yourself, or go to the empty corner. Both are valid, but one might help you practice.",
                 "**Hati:** Before you decide, let's do a Physical, Intellectual, Emotional, and Social check.",
             ],
@@ -905,7 +1189,7 @@ class ScenarioEngine:
             "fbop_spotlight": [
                 "**Hati:** You're standing at the front of the room. Five professors are watching you.",
                 "**Hati:** Let me introduce them: Professor 1 (Dr. Reyes) – Middle, neutral expression, taking notes. Professor 2 (Dr. Cruz) – Stern-looking, arms crossed. Professor 3 (Dr. Santos) – Appears supportive, slight nod. Professor 4 (Dr. Garcia) – Silent, staring at laptop. Professor 5 (Dr. Lopez) – Older, seems tired but attentive.",
-                "**Hati:** They're taking notes. Some have neutral expressions, some look stern. The room is quiet. You're about to present the objectives of your research.",
+                "**Hati:** They're taking notes. Some have neutral expressions, some look stern. The room is quiet. You're about to present the objectives of your project.",
                 "**Hati:** Before you begin, let's do a Physical, Intellectual, Emotional, and Social check.",
             ],
             "general_default": [
@@ -1050,9 +1334,9 @@ class ScenarioEngine:
                 "**Hati:** What do you need to say? Here's a basic template. You can use it or make your own:",
             ]
             opts = [
-                'A: "Good morning, Professor. I need your signature on this data collection request form for my research."',
-                'B: "Excuse me, Professor. Could you please sign this form? It\'s for my thesis data collection."',
-                "C: I'll type my own line",
+                "Good morning, Professor. I need your signature on this class requirement form.",
+                "Excuse me, Professor. Could you please sign this form? It's for a class requirement.",
+                "I'll type my own line",
             ]
             return "foa_s2_script", self._payload(msgs, {"type": "buttons", "options": opts})
 
@@ -1077,16 +1361,16 @@ class ScenarioEngine:
                 "**Hati:** Let's keep this simple. You don't need a conversation. You just need to claim a seat. Here's a basic script:",
                 "**Hati:** Point to the empty seat and ask: 'Is this seat taken?' That's all. The stranger will probably say 'No' or just shake their head.",
                 "**Hati:** Sometimes they might make a small comment, like 'Go ahead' or 'It's free.' If they do, you can just say 'Thanks' and sit down. That's it.",
-                "**Hati:** Let's practice your line silently in your head. Ready?",
+                "**Hati:** Practice your line silently in your head. Tell me whenever you're done.",
             ]
-            return "fsn_s2_practice", self._payload(msgs, {"type": "buttons", "options": ["Continue"]})
+            return "fsn_s2_practice", self._payload(msgs, {"type": "buttons", "options": ["I'm done practicing my line"]})
 
         if theme == "Fear of Being Observed & Performing":
             msgs = [
                 hati,
-                "**Hati:** First, what is the title of your research? Type it below (even a short version is fine).",
+                "**Hati:** First, what is the title of your project? Type it below (even a short version is fine).",
             ]
-            return "fbop_s2_title", self._payload(msgs, {"type": "text_input", "placeholder": "Research title..."})
+            return "fbop_s2_title", self._payload(msgs, {"type": "text_input", "placeholder": "Project title..."})
 
         if theme == "Fear of Social Gatherings":
             msgs = [
@@ -1104,9 +1388,9 @@ class ScenarioEngine:
                 "**Hati:** Pick how you'll open when you're not 100% ready—honest, confident, or your own line.",
             ]
             opts = [
-                "Honest & Brief: I've got the main points, still working on details—here's what I have.",
-                "Confident & Selective: Here's my section—I'll focus on the key findings.",
-                "Defensive (not recommended): I'm not done yet, but you wanted me to share, so...",
+                "I've got the main points, still working on details—here's what I have.",
+                "Here's my section—I'll focus on the key findings.",
+                "I'm not done yet, but you wanted me to share, so...",
                 "Custom response",
             ]
             return "fne_s2_style", self._payload(msgs, {"type": "buttons", "options": opts})
@@ -1132,10 +1416,10 @@ class ScenarioEngine:
         return self._payload(
             [
                 "**Hati:** Good. You have your line. Now let's also prepare for possible questions. The professor might ask:",
-                "\"What's your research about?\"",
-                "\"Have you gotten ethics approval?\"",
-                "\"Why do you need this?\"",
-                "**Hati:** Think quickly: How would you answer one of those? Just a short sentence.",
+                "\"What's this for?\"",
+                "\"What class is this for?\"",
+                "\"Why do you need this signed?\"",
+                "**Hati:** How would you answer one of those? For example 'What's this for?' Answer it on a short sentence.",
             ],
             {"type": "text_input", "placeholder": "Your brief answer..."},
         )
@@ -1168,7 +1452,7 @@ class ScenarioEngine:
             [
                 "**Narrator:** The other student leaves. The professor looks up at you.",
                 "**Professor:** Yes? What is it?",
-                "**Hati:** Say or type what you say next—the line you prepared, or your own words. For example you might ask for a signature on your data collection form, or say you're nervous but need a signature for your thesis.",
+                
             ],
             {"type": "text_input", "placeholder": "What you say to the professor..."},
         )
@@ -1176,43 +1460,18 @@ class ScenarioEngine:
     def _foa_story_branch(self, text, emotion):
         t = (text or "").lower()
         emo = self._detected_emotion_lower(emotion)
-        if any(x in t for x in ["never mind", "nevermind", "walk away", "i'll go", "i should go", "forget it"]):
-            return "freeze"
-        if any(x in t for x in ["just sign", "hurry up", "already", "not how we speak"]):
-            return "anger"
-        clear = any(
-            k in t
-            for k in [
-                "signature",
-                "sign this",
-                "sign my",
-                "data collection",
-                "thesis",
-                "research",
-                "form",
-                "professor",
-                "good morning",
-                "excuse me",
-                "please",
-            ]
-        )
-        disfluent = (
-            sum(1 for x in ["uh", "um", "...", "i…", "i..."] if x in t) >= 2
-            or (("uh" in t or "um" in t) and len(t) < 50 and not clear)
-            or "stumbling" in t
-        )
-        if disfluent:
-            return "anxious"
-        if clear:
-            return "confident"
         if emo in ("anger", "disgust"):
             return "anger"
         if emo in ("sad",):
             return "freeze"
         if emo in ("fear", "anxious"):
             return "anxious"
-        if emo in ("happy", "joy", "surprise", "surprised", "neutral", "calm") and len(t) < 200:
+        if emo in ("neutral", "calm", "happy", "joy", "surprise", "surprised") and len(t) < 200:
             return "confident"
+        if any(x in t for x in ["never mind", "nevermind", "walk away", "i'll go", "i should go", "forget it"]):
+            return "freeze"
+        if any(x in t for x in ["just sign", "hurry up", "already", "not how we speak"]):
+            return "anger"
         return "confident"
 
     def _foa_s3_reaction_enter(self, data):
@@ -1235,7 +1494,7 @@ class ScenarioEngine:
                     return self._payload(
                         [
                             "**Narrator:** The professor takes your form and glances at it.",
-                            "**Professor:** Hmm. What's your research about?",
+                            "**Professor:** Hmm. What's your form about?",
                             "**Hati:** Answer briefly—you prepared for this.",
                         ],
                         {"type": "text_input", "placeholder": "Your answer in a sentence or two..."},
@@ -1280,7 +1539,7 @@ class ScenarioEngine:
                     {"type": "buttons", "options": ["Continue"]},
                 )
             return _to_scene4()
-
+        
         if br == "anger":
             if phase == 0:
                 if entering:
@@ -1335,7 +1594,7 @@ class ScenarioEngine:
             [
                 "**Hati:** Now, what's your small win goal for today? Just sitting down? Asking without stammering? Making eye contact for one second?",
             ],
-            {"type": "text_input", "placeholder": "Type your goal, e.g. Just ask and sit"},
+            {"type": "buttons", "options": ["Just sitting down", "Asking without stammering", "Making eye contact for one second"]},
         )
 
     def _fsn_s2_ready_view(self):
@@ -1351,7 +1610,6 @@ class ScenarioEngine:
             [
                 "**Narrator:** You walk toward the shared table. The stranger looks up briefly, removes one earbud.",
                 "**Stranger:** Oh, hey. Need a seat?",
-                "**Hati:** Say or type how you respond—for example asking if the seat is taken, if it's okay to sit, or a quick friendly line.",
             ],
             {"type": "text_input", "placeholder": "What you say to the stranger..."},
         )
@@ -1371,10 +1629,12 @@ class ScenarioEngine:
             return "anxious"
         if "freeze" in t or "nothing" in t or "walk away" in t or "say nothing" in t:
             return "freeze"
+        if emo in ("sad", "sadness"):
+            return "freeze"
         if emo in ("happy", "joy", "surprise", "surprised") and len(t) < 160:
             if any(k in t for k in ("thanks", "great", "nice", "good", "hey", "hi", "hello", "seat", "sit")):
                 return "curious"
-        if emo in ("fear", "anxious", "sad") and len(t) < 50 and not any(
+        if emo in ("fear", "anxious") and len(t) < 50 and not any(
             k in t for k in ("free", "taken", "sit", "okay", "yeah", "yes")
         ):
             return "anxious"
@@ -1449,7 +1709,7 @@ class ScenarioEngine:
                             "**Stranger:** (looks up, slightly confused) Uh... okay?",
                             "**Hati:** That came off a bit harsh. The stranger didn't do anything wrong. Let's soften it. You can just sit quietly, no need to explain. But notice how anger can push people away.",
                         ],
-                        {"type": "buttons", "options": ["Sit down silently", "Continue"]},
+                        {"type": "buttons", "options": ["Sit down silently"]},
                     )
                 data["fsn_r_phase"] = 1
                 return self._payload(
@@ -1535,8 +1795,7 @@ class ScenarioEngine:
                 if entering:
                     return self._payload(
                         [
-                            "**Narrator:** Dr. Reyes nods. Dr. Santos smiles slightly. Dr. Cruz remains stern but takes notes.",
-                            "**Narrator:** Dr. Garcia looks up briefly. Dr. Lopez listens.",
+                            "**Narrator:** Dr. Reyes nods. Dr. Santos smiles slightly. Dr. Cruz remains stern but takes notes. Dr. Garcia looks up briefly. Dr. Lopez listens.",
                         ],
                         {"type": "buttons", "options": ["Continue"]},
                     )
@@ -1564,9 +1823,9 @@ class ScenarioEngine:
                     return self._payload(
                         [
                             "**Professor 2 (Dr. Cruz, stern):** Speak up, please. We can't hear you.",
-                            "**Hati:** Take a breath. They're not angry, they just need to hear you. Say or type what you do next—for example Of course and then speaking louder, apologizing for nerves, or if you freeze, type that you froze and Hati will help you read from your notes.",
+                            "**Hati:** Take a breath. They're not angry, they just need to hear you. Don't apologize. Just say 'Of Course' and speak a little louder You know your objectives."
                         ],
-                        {"type": "text_input", "placeholder": "What you say or do next..."},
+                        {"type": "buttons", "options": ["Say 'Of course' and speak louder.", "Apologize: 'Sorry, I'm nervous.'", "Freeze and say nothing."],},
                     )
                 ut = (user_text or "").lower()
                 data["fbop_anxious_pick"] = user_text
@@ -1623,7 +1882,25 @@ class ScenarioEngine:
             if phase == 4:
                 return _to_scene4()
             return _to_scene4()
+        
+        if br == "positive":
+            phase = int(data.get("fbop_o_phase", 0))
 
+            if phase == 0:
+                data["fbop_o_phase"] = 1
+                return self._payload(
+                    [
+                        "**Professor 5 (Dr. Lopez, impressed):** Well prepared. Clear objectives. Good start.",
+                        "**Professor 1 (Dr. Reyes):** We look forward to the rest of your defense.",
+                        "**Hati (sidebar):** See? Confidence invites positive feedback.",
+                    ],
+                    {"type": "buttons", "options": ["Continue"]},
+                )
+
+            if phase == 1:
+                return _to_scene4()
+            
+            
         if br == "anger":
             if phase == 1:
                 return _to_scene4()
@@ -1692,7 +1969,7 @@ class ScenarioEngine:
                     )
                 ut = (user_text or "").lower()
                 data["fbop_freeze_pick"] = user_text
-                if any(k in ut for k in ["exit", "leave", "walk out", "out the door", "d3", "can't stay"]):
+                if any(k in ut for k in ["exit", "leave", "walk out", "out the door", "d3", "can't stay", "leaving"]):
                     data["fbop_o_phase"] = 30
                     return self._payload(
                         [
@@ -1707,7 +1984,7 @@ class ScenarioEngine:
                             "**Narrator:** The professors wait quietly.",
                             "**Hati:** Take 30 seconds. Then come back to the podium.",
                         ],
-                        {"type": "buttons", "options": ["Continue"]},
+                        {"type": "buttons", "options": ["I'm ready"]},
                     )
                 data["fbop_o_phase"] = 1
                 return self._payload(
@@ -1743,10 +2020,9 @@ class ScenarioEngine:
         return self._payload(
             [
                 "**Hati:** Good. Now choose an opening line (or custom).",
-                f'A. "Good morning, esteemed panel. Today I will present the objectives of my research titled \'{title}\'."',
-                f'B. "Hello. My research is about this topic—here are my objectives." (title: {title})',
+                f'A. "Good morning, esteemed panel. Today I will present the objectives of my project titled \'{title}\'."',
+                f'B. "Hello. My project is about {title} — here are my objectives."',
                 'C. "Thank you for being here. My objectives are: first..."',
-                "Custom opening",
             ],
             {"type": "buttons", "options": ["Use option A (formal)", "Use option B (simple)", "Use option C (minimal)", "Custom opening"]},
         )
@@ -1763,7 +2039,7 @@ class ScenarioEngine:
         return self._payload(
             [
                 "**Hati:** Now, let's prepare for what comes after. After you state your objectives, one professor will likely ask a question. The most common question is: 'Why are these objectives significant?'",
-                "**Hati:** Let's prepare a short answer. What is the main contribution of your research? Type one sentence.",
+                "**Hati:** Let's prepare a short answer. Type one sentence.",
             ],
             {"type": "text_input", "placeholder": "One sentence on significance..."},
         )
@@ -1822,6 +2098,14 @@ class ScenarioEngine:
     def _fbop_story_branch(self, text, emotion):
         t = (text or "").lower()
         emo = self._detected_emotion_lower(emotion)
+        if emo in ("anger", "disgust") and len(t) < 400:
+            return "anger"
+        if emo in ("fear", "anxious") and len(t) < 400:
+            return "anxious"
+        if emo in ("sad", "sadness", "depressed"):
+            return "freeze"
+        if emo in ("happy", "joy", "calm", "surprise", "surprised"):
+            return "positive"
         if "defensive" in t or "angry" in t or "attitude" in t or "just read" in t:
             return "anger"
         if "barely" in t or "mumbling" in t or "mumble" in t or "too quiet" in t:
@@ -1829,14 +2113,6 @@ class ScenarioEngine:
         if "quiet" in t or "hesitant" in t or "shaky" in t or "nervous" in t or "rushed" in t or "fast" in t:
             return "anxious"
         if "good morning" in t or "thank you" in t or "objectives" in t or "present" in t:
-            return "confident"
-        if emo in ("anger", "disgust") and len(t) < 400:
-            return "anger"
-        if emo in ("fear", "anxious") and len(t) < 400:
-            return "anxious"
-        if emo in ("sad",) and len(t) < 300:
-            return "freeze"
-        if emo in ("happy", "joy", "surprise", "surprised", "neutral", "calm") and len(t) < 500:
             return "confident"
         return "confident"
 
@@ -1862,7 +2138,7 @@ class ScenarioEngine:
             [
                 "**Hati:** Good. Now practice that line silently in your head three times.",
             ],
-            {"type": "buttons", "options": ["Continue"]},
+            {"type": "buttons", "options": ["I'm done"]},
         )
 
     def _fsg_a_relation_view(self):
@@ -1953,7 +2229,7 @@ class ScenarioEngine:
             "**Hati:** Say your opening line now—just as you practiced. You can type it here or use the microphone.",
         ]
         if prepared:
-            lines.append(f"Hati: Your prepared opening: {prepared}")
+            lines.append(f"**Hati:** Your prepared opening: {prepared}")
         return self._payload(
             lines,
             {"type": "text_input", "placeholder": "Type or dictate your opening line..."},
@@ -2001,18 +2277,20 @@ class ScenarioEngine:
     def _fsg_story_branch(self, text, emotion, path):
         t = (text or "").lower()
         emo = self._detected_emotion_lower(emotion)
-        if "phone" in t or "quiet" in t:
+        if "phone" in t or "quiet" in t and "path b" in path.lower():
             return "avoid"
         if "approach" in t and "corner" in path.lower():
             return "confident"
-        if "irritated" in t or emo in ("anger", "disgust"):
+        if emo in ("happy", "joy", "neutral", "calm"):
+            return "confident"
+        if "irritated" in t or emo in ("anger", "angry", "disgust"):
             return "anger"
         if "freeze" in t or "nothing" in t:
             return "freeze"
         if "hesitant" in t or emo in ("fear", "anxious"):
             return "anxious"
-        if emo in ("sad",) and len(t) < 60:
-            return "anxious"
+        if emo in ("sad"):
+            return "freeze"
         if "eye contact" in t and "path b" in path.lower():
             return "confident"
         return "confident"
@@ -2021,10 +2299,22 @@ class ScenarioEngine:
         """Party Scene 3 — follow script beats: follow-up answers, corner choices, opening flow from corner."""
         path_raw = data.get("fsg_path") or ""
         path_l = path_raw.lower()
+        is_path_a = "path a" in path_l or "approach" in path_l
         is_corner = "path b" in path_l or "corner" in path_l
-        br = data.get("story_branch", "confident")
+        emo = self._detected_emotion_lower(data.get("emotion"))
+        base_br = data.get("story_branch")
+        if "path a" in path_l:
+            if emo in ("anger", "disgust"):
+                br = "anger"
+            elif emo in ("fear", "anxious", "nervous", "fearful"):
+                br = "anxious"
+            elif emo in ("sad",):
+                br = "freeze"
+            else:
+                br = base_br or "confident"
+        else:
+            br = base_br or "confident"
         ph = int(data.get("fsg_rx_ph", 0))
-        social_l = ((data.get("fsg_social_pick") or "") + "").lower()
         opening_flow = bool(data.get("fsg_opening_flow")) and is_corner
         entering = user_text is None
 
@@ -2036,14 +2326,13 @@ class ScenarioEngine:
             return self._scene4_debrief_intro(data)
 
         def _opening_from_corner_payload():
-            prepared = (data.get("fsg_open_custom") or data.get("fsg_open_pick") or "").strip()
+
             lines = [
                 "**Narrator:** You walk toward the group. Julia turns slightly.",
                 '**Julia:** Oh, hey! Are you here for the birthday?',
                 "**Hati:** Say your opening line now—just as you practiced. You can type it here or use the microphone.",
             ]
-            if prepared:
-                lines.append(f"Hati: Your prepared opening: {prepared}")
+        
             return self._payload(
                 lines,
                 {"type": "text_input", "placeholder": "Type or dictate your opening line..."},
@@ -2131,7 +2420,8 @@ class ScenarioEngine:
                         ],
                     },
                 )
-            return self._payload(
+            if br == "freeze":
+                return self._payload(
                 [
                     "**Julia:** Hey, you okay? You can sit if you want.",
                     "**Hati:** Don't leave yet. Just pause. Turn around and say one word: 'Okay.' Then take a breath.",
@@ -2139,13 +2429,18 @@ class ScenarioEngine:
                 {
                     "type": "buttons",
                     "options": [
-                        "Say: Okay (then sit down quietly)",
+                        "Okay (then sit down quietly)",
                         "Leave the party",
                     ],
                 },
             )
 
         ut = (user_text or "").lower()
+        if "leave" in ut:
+            data["fsg_rx_ph"] = 999
+            if state is not None:
+                state["step"] = "scene4_debrief_intro"
+            return self._scene4_debrief_intro(data)
 
         if is_corner and opening_flow:
             if ph == 0:
@@ -2342,15 +2637,25 @@ class ScenarioEngine:
             [
                 "**Hati:** Your worth isn't determined by one person's frown. Tap when ready to share your part.",
             ],
-            {"type": "buttons", "options": ["Share Your Part"]},
+            {"type": "buttons", "options": ["I'm ready to share my part"]},
         )
+        
+    def _fne_s3_delivery_view(self):
+        return self._payload(
+            [
+                "**Hati:** You're now presenting your part.",
+                "**Hati:** Start with your opening line, then your key points. You can type it or simulate speaking."
+            ],
+            {"type": "text_input", "placeholder": "Your opening + key points..."},
+        )    
 
     def _fne_s3_carlo_view(self):
         return self._payload(
             [
-                "**Hati:** You share your opening and key points. Precious nods. Julia glances up.",
-                "**Carlo:** That's it?",
-                "**Hati:** Ouch—but notice: dismissive, not 'your work is trash.' How do you respond? Say or type what you say next.",
+                "**Precious (supportive):** */nods, makes a small note.",
+                "**Julia (neutral):** */looks up briefly, then back at laptop.",
+                "**Carlo:** */frowns slightly. 'That's it?'",
+                "**Hati:** Ouch. That stings. But notice: Carlo didn't say your work is bad – they just asked a dismissive question. You just have to respond.",
             ],
             {"type": "text_input", "placeholder": "Your response to Carlo..."},
         )
@@ -2362,9 +2667,18 @@ class ScenarioEngine:
         """
         t = (text or "").lower()
         emo = self._detected_emotion_lower(emotion)
-
+        
         if not t.strip() or "freeze" in t or "say nothing" in t or t.strip() in (".", "...", "—"):
             return "freeze"
+        
+        if emo in ("fear", "anxious") and len(t) < 220:
+            return "apologetic"
+        if emo in ("happy", "joy", "surprise", "surprised") and len(t) < 220:
+            return "curious"
+        if emo == "sad" and len(t) < 120:
+            return "freeze"
+        if emo in ("neutral", "calm") and len(t) < 220:
+            return "calm"
 
         if "back off" in t or "shut up" in t or "leave me alone" in t:
             return "anger"
@@ -2393,27 +2707,20 @@ class ScenarioEngine:
         ):
             return "calm"
 
-        if emo in ("fear", "anxious") and len(t) < 220:
-            return "apologetic"
-        if emo in ("happy", "joy", "surprise", "surprised") and len(t) < 220:
-            return "curious"
-        if emo == "sad" and len(t) < 120:
-            return "freeze"
-        if emo in ("neutral", "calm") and len(t) < 220:
-            return "calm"
-
         return "calm"
 
     def _fne_s3_outcome_view(self, data):
         br = data.get("story_branch", "calm")
         if br == "calm":
             msgs = [
-                "**Carlo:** Alright. Just checking. Precious: Good start. Julia: We can fill gaps later.",
+                "**Carlo:** Alright. Just checking.", 
+                "Precious: Good start. Julia: We can fill gaps later.",
                 "**Hati:** You didn't collapse or attack—you stated your boundary.",
             ]
         elif br == "curious":
             msgs = [
-                "**Carlo:** I thought you'd have more data—okay, maybe we brainstorm. Precious: Let's help each other.",
+                "**Carlo:** I thought you'd have more data—okay, maybe we brainstorm.", 
+                "Precious: Let's help each other.",
                 "**Hati:** You turned criticism into collaboration.",
             ]
         elif br == "apologetic":
@@ -2427,7 +2734,9 @@ class ScenarioEngine:
             )
         elif br == "anger":
             msgs = [
-                "**Carlo:** Excuse me? I'm just asking. Precious: Let's calm down. Julia: Maybe a break.",
+                "**Carlo:** Excuse me? I'm just asking." ,
+                "**Precious:** Let's calm down.",
+                "**Julia:** Maybe a break.",
                 "**Hati:** Anger escalated things—brief repair helps: 'Sorry, I'm stressed—here's what I have.'",
             ]
         else:
@@ -2515,11 +2824,11 @@ class ScenarioEngine:
             return "freeze"
         if "defensive" in t or "irritated" in t or emo in ("anger", "disgust"):
             return "anger"
-        if "anxious" in t or "unconvincing" in t or emo in ("fear", "anxious"):
+        if "anxious" in t or "unconvincing" in t or emo in ("fear", "anxious", "surprise", "surprised"):
             return "anxious"
         if emo == "sad" and len(t) < 120:
-            return "anxious"
-        if emo in ("happy", "joy", "surprise", "surprised", "neutral", "calm") and len(t) < 200:
+            return "freeze"
+        if emo in ("happy", "joy", "neutral", "calm") and len(t) < 200:
             return "calm"
         return "calm"
 
@@ -2742,11 +3051,13 @@ class ScenarioEngine:
     def _scene4_debrief_intro(self, data):
         theme = data.get("theme", "")
         sk = data.get("scenario_key", "")
+        prefix = "**Hati:** The scenario is over now, so let’s take a moment to reflect on what happened."
         if theme == "Fear of Strangers & New People" and sk == "fsn_classroom":
             lead = "**Hati:** Okay. Let's pause and reflect. You just did something that takes courage—you approached a stranger."
             messages = [
+                prefix,
                 lead,
-                "**Hati:** Let's compare what you predicted would happen with what actually happened.",
+                "**Hati:** Let's compare what you **predicted** would happen with what **actually** happened.",
             ]
             return self._payload(messages, {"type": "buttons", "options": ["Continue"]})
         lead = {
@@ -2758,8 +3069,9 @@ class ScenarioEngine:
             "Physiological Symptoms": "**Hati:** Let's pause and reflect. You experienced visible physical symptoms in public, and someone noticed. That's a fear many people with anxiety have.",
         }.get(theme, "**Hati:** Let's pause and reflect. You showed up for something socially demanding.")
         messages = [
+            prefix,
             lead,
-            "**Hati:** Let's compare what you predicted with what actually happened.",
+            "**Hati:** Let's compare what you **predicted** with what **actually** happened.",
         ]
         return self._payload(messages, {"type": "buttons", "options": ["Continue"]})
 
@@ -2853,7 +3165,13 @@ class ScenarioEngine:
     def _scene4_fne_severity(self):
         return self._payload(
             ["**Hati:** Rate how bad the actual outcome was (0 = nothing, 10 = disaster)."],
-            {"type": "text_input", "placeholder": "Type a number 0-10..."},
+            {
+                "type": "buttons",
+                "options": [
+                    "0", "1", "2", "3", "4",
+                    "5", "6", "7", "8", "9", "10"
+                ],
+            },
         )
 
     def _scene4_fne_goal_done_view(self, data):
@@ -2866,7 +3184,7 @@ class ScenarioEngine:
     def _scene4_bad(self):
         return self._payload(
             ["**Hati:** Did anything bad actually happen?"],
-            {"type": "buttons", "options": ["Yes", "No", "Not sure"]},
+            {"type": "buttons", "options": ["Yes", "No"]},
         )
 
     def _scene4_bad_detail(self):
@@ -2926,30 +3244,30 @@ class ScenarioEngine:
                 msg = "**Hati:** Thank you for being honest. You showed up and practiced."
             elif actual < pred:
                 msg = (
-                    "**Hati:** Look at that—your actual anxiety was lower than you predicted. That's evidence. "
-                    "**Hati:** Your brain predicted danger, but reality was safer or more neutral. Every time this happens, "
+                    "**Hati:** Look at that—your **actual** anxiety was lower than you **predicted**. That's evidence. "
+                    "Your brain predicted **danger**, but **reality** was safer or more neutral. Every time this happens, "
                 )
             elif actual == pred:
                 msg = (
                     "**Hati:** Thank you for being honest. It's still hard, and that's okay. What matters is that you did it anyway. "
-                    "**Hati:** That's courage—feeling the fear and doing it. We'll keep practicing."
+                    "That's courage—feeling the fear and doing it. We'll keep practicing."
                 )
             else:
                 msg = (
                     "**Hati:** I appreciate your honesty. Today was harder than expected, and that happens. "
-                    "**Hati:** The fact that you stayed and tried anyway—that's resilience. Let's try an even bigger step next time."
+                    "The fact that you stayed and tried anyway—that's resilience. Let's try an even bigger step next time."
                 )
         elif pred is None or actual is None:
             msg = "**Hati:** Thank you for being honest. You showed up and practiced."
         elif br == "freeze" or "avoid" in br or (bad.startswith("y") and "left" in (data.get("bad_detail") or "").lower()):
             msg = (
                 "**Hati:** You chose to step back—that's information, not failure. "
-                "**Hati:** Next time we can try a smaller step (a single word, standing nearby, or ten seconds in the room)."
+                "Next time we can try a smaller step."
             )
         elif actual < pred:
             msg = (
-                "**Hati:** Look at that—your actual anxiety was lower than predicted. "
-                "**Hati:** Your brain predicted danger, but reality was manageable. That's evidence you can use next time."
+                "**Hati:** Look at that—your **actual** anxiety was lower than you **predicted**. "
+                "Your brain predicted **danger**, but **reality** was manageable. That's evidence you can use next time."
             )
         elif actual == pred:
             msg = (
@@ -2963,19 +3281,24 @@ class ScenarioEngine:
 
     def _scene4_reflection(self, data):
         theme = data.get("theme", "")
+
         if theme == "Fear of Negative Evaluation & Embarrassment":
             messages = [
                 "**Hati:** What feels different now that the moment has passed?",
             ]
+
         elif theme == "Physiological Symptoms":
             messages = [
                 "**Hati:** Did the classmate react with disgust—or mostly concern or neutrality?",
             ]
+
         else:
-            messages = [
-                "**Hati:** What do you notice now about how others showed up—scary, neutral, kinder than expected?",
-            ]
-        return self._payload(messages, {"type": "text_input", "placeholder": "Type your response..."})
+            return self._scene5_coping(data)
+
+        return self._payload(
+            messages,
+            {"type": "text_input", "placeholder": "Type your response..."}
+        )
 
     def _scene5_coping(self, data):
         emotion = (data.get("emotion") or "").lower()
@@ -3085,7 +3408,7 @@ class ScenarioEngine:
         messages = [
             intro,
             tool,
-            "**Hati:** Want to try this together now?",
+            "**Hati:** Do you want to try this by yourself now?",
         ]
         return self._payload(messages, {"type": "buttons", "options": ["Yes", "Maybe later", "No"]})
 
@@ -3120,13 +3443,13 @@ class ScenarioEngine:
         elif theme == "Physiological Symptoms":
             insight = "**Hati:** Your body can spike adrenaline without danger. Symptoms are uncomfortable, not proof of catastrophe."
         if br == "anxious":
-            insight += "**Hati:** You stayed in the hard version—and that still matters."
+            insight += "You stayed in the hard version—and that still matters."
         elif br in ("anger",):
-            insight += "**Hati:** Repair and reset are skills too—you can practice a softer start next time."
+            insight += "Repair and reset are skills too—you can practice a softer start next time."
         elif br == "curious":
-            insight += "**Hati:** Small talk is a skill—you practiced turning nerves into connection."
+            insight += "Small talk is a skill—you practiced turning nerves into connection."
         elif br in ("freeze", "avoid"):
-            insight += "**Hati:** If you backed away, we'll shrink the next practice until it fits—progress isn't only loud moments."
+            insight += "If you backed away, we'll shrink the next practice until it fits—progress isn't only loud moments."
         messages = [
             "**Hati:** Here's what I want you to remember:",
             insight,
@@ -3144,16 +3467,16 @@ class ScenarioEngine:
 
     def _complete(self):
         return self._payload(
-            ["CONGRATULATIONS! YOU COMPLETED A SCENARIO!"],
+            ["**CONGRATULATIONS! YOU COMPLETED A SCENARIO!**"],
             {"type": "text_input"},
         )
 
     def _complete_and_dashboard(self, data=None):
         data = data or {}
         sk = data.get("scenario_key", "")
-        congrats = "CONGRATULATIONS! YOU COMPLETED A SCENARIO!"
+        congrats = "**CONGRATULATIONS! YOU COMPLETED A SCENARIO!**"
         if sk == "fsn_classroom":
-            congrats = "CONGRATULATIONS! YOU JUST COMPLETED A SCENARIO!"
+            congrats = "**CONGRATULATIONS! YOU JUST COMPLETED A SCENARIO!**"
         hati_extra = "**Hati:** Great work. I've logged your emotions. Over time you'll see patterns—what feels hardest and how confidence grows."
         if sk == "fsn_classroom":
             hati_extra = (
@@ -3163,7 +3486,7 @@ class ScenarioEngine:
         messages = [
             congrats,
             hati_extra,
-            "Want to see your progress so far?",
+            "**Hati:** Want to see your progress so far?",
         ]
         return self._payload(messages, {"type": "buttons", "options": ["Open Progress", "Close"]})
 
@@ -3216,12 +3539,15 @@ class ScenarioEngine:
         except Exception:
             self.sessions = {}
 
-    def _save(self):
+    def _save(self, session_id=None):
         tmp_path = self.storage_path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.sessions, f)
             os.replace(tmp_path, self.storage_path)
+            
+            if session_id:
+                self._update_step_in_db(session_id)
         except Exception:
             pass
 

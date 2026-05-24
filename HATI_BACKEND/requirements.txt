@@ -4,3 +4,4 @@ transformers
 numpy
 soundfile
 resampy
+firebase-admin
