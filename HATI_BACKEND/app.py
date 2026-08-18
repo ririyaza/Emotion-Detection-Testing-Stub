@@ -79,7 +79,7 @@ scenario_engine = ScenarioEngine(storage_path="scenario_sessions.json")
 # Initialize Firebase for emotion logging
 FIREBASE_CREDS = os.getenv(
     "FIREBASE_CREDENTIALS",
-    "firebase/hati-25259-firebase-adminsdk-fbsvc-813789fa41.json"
+    "firebase/hati-25259-firebase-adminsdk-fbsvc-6f82b91cce.json"
 )
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "hati-25259")
 emotion_db = init_emotion_database(FIREBASE_CREDS, FIREBASE_PROJECT_ID)
@@ -467,7 +467,10 @@ def scenario_start():
     
     # No unfinished scenario found, start a new one
     session_id, payload = scenario_engine.start_session(theme=theme, scenario_key=scenario_key)
-    return jsonify(_json_merge_session(session_id, payload))
+    response = _json_merge_session(session_id, payload)
+    state = scenario_engine.sessions.get(session_id)
+    response["step"] = state.get("step") if state else None
+    return jsonify(response)
 
 
 @app.route("/scenario/step", methods=["POST"])
@@ -503,6 +506,7 @@ def scenario_step():
 
     state = scenario_engine.sessions.get(session_id)
     response = _json_merge_session(session_id, response_payload)
+    response["step"] = state.get("step") if state else None
     if state is not None:
         history = state.setdefault("history", [])
         user_event = {"role": "user", "payload": {"text": user_text}}
@@ -618,6 +622,7 @@ def scenario_step_audio():
     })
 
     state = scenario_engine.sessions.get(session_id)
+    out["step"] = state.get("step") if state else None
     if state is not None:
         history = state.setdefault("history", [])
         user_event = {

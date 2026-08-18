@@ -1,0 +1,7 @@
+firebase/*.json
+!firebase/.gitkeep
+*.env
+.env
+hati_env/
+__pycache__/
+*.pyc

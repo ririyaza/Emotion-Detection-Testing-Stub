@@ -308,6 +308,7 @@ class ScenarioEngine:
             data["foa_r_phase"] = 0
             state["step"] = "foa_s3_reaction"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -356,6 +357,7 @@ class ScenarioEngine:
             data["fsn_r_phase"] = 0
             state["step"] = "fsn_s3_reaction"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -373,6 +375,7 @@ class ScenarioEngine:
             data["fsn_r_phase"] = 0
             state["step"] = "fsn_s3_reaction"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -463,6 +466,7 @@ class ScenarioEngine:
             data["fbop_o_phase"] = 0
             state["step"] = "fbop_s3_outcome"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -593,6 +597,7 @@ class ScenarioEngine:
             data["fsg_rx_ph"] = 0
             state["step"] = "fsg_s3_reaction"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -681,6 +686,7 @@ class ScenarioEngine:
             data["fne_outcome_phase"] = 0
             state["step"] = "fne_s3_outcome"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -792,6 +798,7 @@ class ScenarioEngine:
             data["phys_r_ph"] = 0
             state["step"] = "phys_s3_reaction"
             self._save(session_id)
+            # Log emotion with story branch
             self._log_emotion(
                 session_id,
                 data.get("emotion", ""),
@@ -1135,9 +1142,14 @@ class ScenarioEngine:
         return known.get(lowered, theme)
 
     def _resolve_scenario_key(self, theme, raw_key):
-        canonical = THEME_SCENARIO_KEYS.get(theme, "general_default")
-        allowed = ALLOWED_SCENARIO_KEYS.get(theme, {canonical})
+        normalized_theme = self._normalize_theme(theme)
+        canonical = THEME_SCENARIO_KEYS.get(normalized_theme, "general_default")
+        allowed = ALLOWED_SCENARIO_KEYS.get(normalized_theme, {canonical})
         rk = str(raw_key or "").strip()
+        if normalized_theme == "Fear of Authority":
+            if rk in allowed:
+                return rk
+            return "foa_supervisor"
         if rk in allowed:
             return rk
         return canonical

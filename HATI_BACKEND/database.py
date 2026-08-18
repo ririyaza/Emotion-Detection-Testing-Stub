@@ -21,6 +21,31 @@ class EmotionDatabase:
         self.client = None
         
         self._initialize_firebase()
+
+    def _disable_firebase(self, error=None):
+        """Safely disable Firebase access after an auth or metadata failure."""
+        self.initialized = False
+        self.client = None
+        if error:
+            print(f"Firebase disabled due to auth/metadata failure: {error}")
+
+    @staticmethod
+    def _is_auth_error(error):
+        """Return True when the error indicates invalid or expired Firebase credentials."""
+        if error is None:
+            return False
+        message = str(error).lower()
+        auth_markers = (
+            "invalid_grant",
+            "invalid jwt",
+            "jwt signature",
+            "metadata from plugin failed",
+            "unauthorized",
+            "permission denied",
+            "token refresh",
+            "invalid credentials",
+        )
+        return any(marker in message for marker in auth_markers)
     
     def _initialize_firebase(self):
         """Initialize Firebase app with credentials."""
@@ -74,6 +99,8 @@ class EmotionDatabase:
             
             return True
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error logging emotion to Firebase: {e}")
             return False
     
@@ -100,6 +127,8 @@ class EmotionDatabase:
             docs = logs_collection.stream()
             return {doc.id: doc.to_dict() for doc in docs}
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error retrieving emotion logs: {e}")
             return None
     
@@ -123,6 +152,8 @@ class EmotionDatabase:
             docs = scenarios_collection.stream()
             return {doc.id: doc.to_dict() for doc in docs}
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error retrieving user scenarios: {e}")
             return None
 
@@ -149,6 +180,8 @@ class EmotionDatabase:
             scenario_ref.set(metadata)
             return True
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error creating scenario metadata: {e}")
             return False
 
@@ -178,6 +211,8 @@ class EmotionDatabase:
             })
             return True
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error updating scenario step: {e}")
             return False
 
@@ -208,6 +243,8 @@ class EmotionDatabase:
             })
             return True
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error updating scenario state: {e}")
             return False
 
@@ -236,6 +273,8 @@ class EmotionDatabase:
                 return data.get('session_state')
             return None
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error retrieving scenario state: {e}")
             return None
 
@@ -260,6 +299,8 @@ class EmotionDatabase:
             docs = query.stream()
             return {doc.id: doc.to_dict() for doc in docs}
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error retrieving unfinished scenarios: {e}")
             return None
     
@@ -287,6 +328,8 @@ class EmotionDatabase:
             log_ref.document(log_id).delete()
             return True
         except Exception as e:
+            if self._is_auth_error(e):
+                self._disable_firebase(e)
             print(f"Error deleting emotion log: {e}")
             return False
 
